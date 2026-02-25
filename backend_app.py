@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,7 +56,12 @@ def get_diarization_pipeline() -> Any:
     try:
         from pyannote.audio import Pipeline
 
-        _PIPELINE = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
+        from_pretrained_sig = inspect.signature(Pipeline.from_pretrained)
+        auth_arg = "token" if "token" in from_pretrained_sig.parameters else "use_auth_token"
+
+        _PIPELINE = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1", **{auth_arg: token}
+        )
         return _PIPELINE
     except Exception as exc:
         raise HTTPException(
