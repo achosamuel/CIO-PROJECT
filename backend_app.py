@@ -26,6 +26,7 @@ app.add_middleware(
 
 _PIPELINE = None
 _ALLOWED_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
+TOKEN = "hf_iRzVdteghGHWYljbOQYAmPOJaYJM"
 
 
 @dataclass
@@ -41,7 +42,7 @@ def get_diarization_pipeline() -> Any:
     if _PIPELINE is not None:
         return _PIPELINE
 
-    token = os.getenv("HF_TOKEN")
+    token = os.getenv("HF_TOKEN", TOKEN)
     if not token:
         raise HTTPException(
             status_code=503,
@@ -54,7 +55,7 @@ def get_diarization_pipeline() -> Any:
     try:
         from pyannote.audio import Pipeline
 
-        _PIPELINE = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+        _PIPELINE = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
         return _PIPELINE
     except Exception as exc:
         raise HTTPException(
