@@ -1,11 +1,17 @@
-"""Streamlit frontend for recording/uploading audio and showing diarization insights."""
+"""Streamlit frontend for diarization + collective organization analysis.
+
+Local run:
+- Set backend env vars first (PowerShell): $env:OPENAI_API_KEY="..." ; $env:HF_TOKEN="..."
+- Backend: uvicorn backend_app:app --host 127.0.0.1 --port 8000
+- Frontend: streamlit run frontend_app.py
+"""
 
 from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 import requests
 import sounddevice as sd
@@ -13,10 +19,10 @@ import streamlit as st
 
 from utils_audio import save_numpy_audio_to_wav
 
-st.set_page_config(page_title="Speaker Counter + Interruption Detector", layout="wide")
-st.title("🎙️ Speaker Counter + Interruption Detector")
+st.set_page_config(page_title="Brainstorming Facilitator", layout="wide")
+st.title("🎙️ Brainstorming Facilitator")
 
-backend_url = st.sidebar.text_input("Backend URL", value="http://localhost:8000/analyze")
+backend_url = st.sidebar.text_input("Backend URL", value="http://localhost:8000/collective")
 record_duration = st.sidebar.slider("Record duration (seconds)", min_value=5, max_value=60, value=10)
 min_overlap_threshold = st.sidebar.slider("Min overlap threshold (seconds)", 0.0, 2.0, 0.2, 0.1)
 cut_in_window = st.sidebar.slider("Cut-in window (seconds)", 0.1, 3.0, 1.0, 0.1)
@@ -95,7 +101,7 @@ def draw_timeline(segments: list[dict]) -> None:
     st.pyplot(fig)
 
 
-if st.button("Analyze"):
+if st.button("Analyze + Collective Organization"):
     if not selected:
         st.error("Please record or upload an audio file first.")
     else:
@@ -119,15 +125,53 @@ if st.button("Analyze"):
                     st.success("Analysis complete.")
 
                     st.subheader("Summary")
-                    st.write(f"**Number of speakers:** {result['num_speakers']}")
-                    st.write(f"**Speakers:** {', '.join(result['speakers']) if result['speakers'] else 'None'}")
+                    st.write(f"**Number of speakers:** {result.get('num_speakers', 0)}")
+                    st.write(
+                        f"**Speakers:** {', '.join(result.get('speakers', [])) if result.get('speakers') else 'None'}"
+                    )
 
                     st.subheader("Per-speaker speaking time")
                     totals = compute_speaker_totals(result.get("segments", []))
                     totals_df = pd.DataFrame(
                         [{"speaker": s, "total_seconds": round(t, 3)} for s, t in totals.items()]
-                    ).sort_values("total_seconds", ascending=False)
+                    )
+                    if not totals_df.empty:
+                        totals_df = totals_df.sort_values("total_seconds", ascending=False)
                     st.dataframe(totals_df, use_container_width=True)
+
+                    st.subheader("Collective Organization Score")
+                    scores = result.get("scores", {})
+                    s1, s2, s3, s4 = st.columns(4)
+                    s1.metric("Overall", scores.get("collective_organization", "-"))
+                    s2.metric("Independence", scores.get("independence", "-"))
+                    s3.metric("Participation Balance", scores.get("participation_balance", "-"))
+                    s4.metric("Idea Diversity", scores.get("idea_diversity", "-"))
+
+                    debug_metrics = scores.get("debug", {})
+                    if debug_metrics:
+                        st.caption("Debug metrics")
+                        debug_df = pd.DataFrame(
+                            [{"metric": key, "value": value} for key, value in debug_metrics.items()]
+                        )
+                        st.dataframe(debug_df, use_container_width=True)
+
+                    st.subheader("Idea Map")
+                    main_ideas = result.get("idea_map", {}).get("main_ideas", [])
+                    if not main_ideas:
+                        st.write("No ideas extracted.")
+                    for main_idea in main_ideas:
+                        title = main_idea.get("title", "Untitled")
+                        st.markdown(f"**{main_idea.get('id', 'I?')} — {title}**")
+                        st.write(main_idea.get("summary", ""))
+                        with st.expander("Sub-ideas", expanded=False):
+                            for idx, sub_idea in enumerate(main_idea.get("sub_ideas", []), start=1):
+                                st.markdown(f"{idx}. {sub_idea.get('text', '')}")
+                                st.caption(f"Speakers: {', '.join(sub_idea.get('speakers', [])) or 'UNKNOWN'}")
+                                evidence = sub_idea.get("evidence", [])
+                                if evidence:
+                                    st.markdown("Evidence:")
+                                    for quote in evidence:
+                                        st.markdown(f"- \"{quote}\"")
 
                     st.subheader("Interruptions")
                     interruptions = result.get("interruptions", [])
@@ -145,6 +189,5 @@ if st.button("Analyze"):
                 st.error(f"Unexpected frontend error: {exc}")
 
 st.caption(
-    "If diarization fails, make sure backend has HF_TOKEN set and that your account has access "
-    "to pyannote models."
+    "Backend needs HF_TOKEN and OPENAI_API_KEY. OpenAI calls are server-side only in backend_app.py."
 )
