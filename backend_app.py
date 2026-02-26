@@ -27,7 +27,6 @@ app.add_middleware(
 
 _PIPELINE = None
 _ALLOWED_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
-TOKEN = "hf_iRzVdteghGHWYljbOQYAmPOJaYJM"
 
 
 @dataclass
@@ -43,13 +42,13 @@ def get_diarization_pipeline() -> Any:
     if _PIPELINE is not None:
         return _PIPELINE
 
-    token = os.getenv("HF_TOKEN", TOKEN)
-    if not token:
+    token = os.getenv("HF_TOKEN", "").strip()
+    if not token or not token.startswith("hf_"):
         raise HTTPException(
             status_code=503,
             detail=(
-                "Missing Hugging Face token. Set HF_TOKEN and make sure you accepted "
-                "model terms for pyannote/speaker-diarization-3.1."
+                "Missing/invalid Hugging Face token. Set a valid HF_TOKEN (starts with 'hf_') "
+                "and make sure you accepted model terms for pyannote/speaker-diarization-3.1."
             ),
         )
 
@@ -62,6 +61,8 @@ def get_diarization_pipeline() -> Any:
         _PIPELINE = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1", **{auth_arg: token}
         )
+        if _PIPELINE is None:
+            raise RuntimeError("Pipeline.from_pretrained returned None")
         return _PIPELINE
     except Exception as exc:
         raise HTTPException(
@@ -228,7 +229,17 @@ async def analyze_audio(
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
             pipeline = get_diarization_pipeline()
-            diarization = pipeline(str(wav_path))
+            try:
+                diarization = pipeline(str(wav_path))
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Diarization model is unavailable. Confirm HF_TOKEN has access to "
+                        "pyannote/speaker-diarization-3.1 and that model terms are accepted. "
+                        f"Underlying error: {exc}"
+                    ),
+                ) from exc
 
             segments: list[Segment] = []
             for turn, _, speaker in diarization.itertracks(yield_label=True):
