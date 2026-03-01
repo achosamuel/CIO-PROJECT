@@ -1,8 +1,19 @@
-"""FastAPI backend for diarization + collective organization analysis.
+"""
+FastAPI backend for diarization + collective organization + idea map (FREE).
 
-Local run:
-- PowerShell: $env:OPENAI_API_KEY="..." ; $env:HF_TOKEN="..."
-- API server: uvicorn backend_app:app --host 127.0.0.1 --port 8000
+Pipeline:
+- Normalize audio to WAV 16k mono (utils_audio.py)
+- Speaker diarization (pyannote) using HF_TOKEN
+- Transcription (offline) using faster-whisper
+- Idea map (offline) using TF-IDF + clustering (no torch / no transformers)
+
+Run (PowerShell):
+  $env:HF_TOKEN="hf_iRzVdteghGHWYljbOQYAmPOJaYJM"
+  uvicorn backend_app:app --host 127.0.0.1 --port 8000 --reload
+
+Notes:
+- Requires FFmpeg available on PATH (used by utils_audio conversion).
+- Requires you accepted the model conditions for pyannote/speaker-diarization-3.1 on Hugging Face.
 """
 
 from __future__ import annotations
@@ -13,29 +24,44 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from utils_audio import AudioConversionError, convert_audio_bytes_to_wav16k_mono
 
-app = FastAPI(title="Speaker Counter + Interruption Detector")
 
-# Helpful for local frontend-backend communication.
+# -------------------------
+# App + CORS
+# -------------------------
+
+app = FastAPI(title="Collective Intelligence Audio Analyzer")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:8501",
+        "http://127.0.0.1:8501",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-_PIPELINE = None
-_OPENAI_CLIENT: OpenAI | None = None
 _ALLOWED_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
 
+# Caches (loaded once, reused)
+_PIPELINE: Any | None = None
+_WHISPER_MODEL = None
+
+
+# -------------------------
+# Data structures
+# -------------------------
 
 @dataclass
 class Segment:
@@ -44,25 +70,31 @@ class Segment:
     speaker: str
 
 
-def get_openai_client() -> OpenAI:
-    """Create/cached OpenAI client with API key from env."""
-    global _OPENAI_CLIENT
-    if _OPENAI_CLIENT is not None:
-        return _OPENAI_CLIENT
+# -------------------------
+# Utils
+# -------------------------
 
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="OPENAI_API_KEY is missing. Set it on the backend server and retry.",
-        )
+def _require_positive(name: str, value: float) -> None:
+    if value < 0:
+        raise HTTPException(status_code=400, detail=f"{name} must be >= 0")
 
-    _OPENAI_CLIENT = OpenAI(api_key=api_key, timeout=60.0)
-    return _OPENAI_CLIENT
 
+def _safe_suffix(filename: str | None) -> str:
+    return Path(filename or "").suffix.lower()
+
+
+# -------------------------
+# HF + pyannote diarization
+# -------------------------
 
 def get_diarization_pipeline() -> Any:
-    """Create/cached pyannote pipeline with HF token."""
+    """
+    Load/cached pyannote pipeline with HF token.
+
+    This tries to be robust across pyannote/hub versions by:
+    - Passing auth token directly to Pipeline.from_pretrained when supported.
+    - Falling back to huggingface_hub.login if needed.
+    """
     global _PIPELINE
     if _PIPELINE is not None:
         return _PIPELINE
@@ -72,36 +104,45 @@ def get_diarization_pipeline() -> Any:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Missing/invalid Hugging Face token. Set a valid HF_TOKEN (starts with 'hf_') "
-                "and make sure you accepted model terms for pyannote/speaker-diarization-3.1."
+                "Missing/invalid HF_TOKEN. Set HF_TOKEN (starts with 'hf_') and accept the "
+                "terms for pyannote/speaker-diarization-3.1 on Hugging Face."
             ),
         )
 
     try:
         from pyannote.audio import Pipeline
 
-        from_pretrained_sig = inspect.signature(Pipeline.from_pretrained)
-        auth_arg = "token" if "token" in from_pretrained_sig.parameters else "use_auth_token"
+        # Some versions support: Pipeline.from_pretrained(..., token=...)
+        # Others: use_auth_token=...
+        sig = inspect.signature(Pipeline.from_pretrained)
+        if "token" in sig.parameters:
+            _PIPELINE = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
+        elif "use_auth_token" in sig.parameters:
+            _PIPELINE = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+        else:
+            # Last resort: login then load
+            from huggingface_hub import login
+            login(token=token)
+            _PIPELINE = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
 
-        _PIPELINE = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1", **{auth_arg: token}
-        )
         if _PIPELINE is None:
             raise RuntimeError("Pipeline.from_pretrained returned None")
+
         return _PIPELINE
+
     except Exception as exc:
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Could not load diarization model. Verify HF_TOKEN, accept model access "
-                "permissions on Hugging Face, and ensure torch/pyannote are installed. "
-                f"Underlying error: {exc}"
-            ),
+            detail=f"Could not load diarization model: {exc}",
         ) from exc
 
 
+# -------------------------
+# Overlap + interruption logic
+# -------------------------
+
 def merge_overlap_events(overlap_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Merge overlap events that touch/intersect, combining speaker sets."""
+    """Merge overlap windows that intersect/touch and combine speaker sets."""
     if not overlap_events:
         return []
 
@@ -111,50 +152,41 @@ def merge_overlap_events(overlap_events: list[dict[str, Any]]) -> list[dict[str,
     for event in overlap_events:
         if not merged or event["start"] > merged[-1]["end"]:
             merged.append(
-                {
-                    "start": event["start"],
-                    "end": event["end"],
-                    "speakers": set(event["speakers"]),
-                }
+                {"start": event["start"], "end": event["end"], "speakers": set(event["speakers"])}
             )
         else:
             merged[-1]["end"] = max(merged[-1]["end"], event["end"])
             merged[-1]["speakers"].update(event["speakers"])
 
-    finalized = []
+    out = []
     for event in merged:
         speakers_sorted = sorted(event["speakers"])
-        finalized.append(
+        out.append(
             {
-                "start": round(event["start"], 3),
-                "end": round(event["end"], 3),
+                "start": round(float(event["start"]), 3),
+                "end": round(float(event["end"]), 3),
                 "speakers": speakers_sorted,
-                "duration": round(event["end"] - event["start"], 3),
+                "duration": round(float(event["end"]) - float(event["start"]), 3),
             }
         )
-    return finalized
+    return out
 
 
 def detect_overlaps(segments: list[Segment], min_overlap: float = 0.2) -> list[dict[str, Any]]:
-    """Find overlap windows across speaker segments."""
+    """Find overlap windows across different-speaker segments."""
     events: list[dict[str, Any]] = []
+    n = len(segments)
 
-    for i in range(len(segments)):
+    for i in range(n):
         a = segments[i]
-        for j in range(i + 1, len(segments)):
+        for j in range(i + 1, n):
             b = segments[j]
             if a.speaker == b.speaker:
                 continue
             start = max(a.start, b.start)
             end = min(a.end, b.end)
             if end > start and (end - start) >= min_overlap:
-                events.append(
-                    {
-                        "start": start,
-                        "end": end,
-                        "speakers": [a.speaker, b.speaker],
-                    }
-                )
+                events.append({"start": start, "end": end, "speakers": [a.speaker, b.speaker]})
 
     return merge_overlap_events(events)
 
@@ -164,26 +196,30 @@ def infer_interruptions(
     overlaps: list[dict[str, Any]],
     cut_in_window: float = 1.0,
 ) -> list[dict[str, Any]]:
-    """Infer interruptions from overlap windows."""
+    """
+    Infer interruptions from overlap windows.
+
+    Heuristic:
+    - interrupted speaker: already speaking just before overlap start
+    - interrupter: starts within cut_in_window of overlap start and is active at overlap start
+    """
     interruptions: list[dict[str, Any]] = []
 
     for overlap in overlaps:
-        o_start = overlap["start"]
-        o_end = overlap["end"]
+        o_start = float(overlap["start"])
+        o_end = float(overlap["end"])
 
-        interrupted = None
-        interrupter = None
-
-        for seg in segments:
-            if seg.start <= o_start <= seg.end and seg.end >= o_start:
-                was_already_talking = seg.start <= (o_start - 0.05)
-                if was_already_talking:
-                    interrupted = seg.speaker
+        interrupted: Optional[str] = None
+        interrupter: Optional[str] = None
 
         for seg in segments:
-            starts_near_overlap = 0 <= (o_start - seg.start) <= cut_in_window
-            active_during_overlap = seg.start <= o_start <= seg.end
-            if starts_near_overlap and active_during_overlap and seg.speaker != interrupted:
+            if seg.start <= o_start <= seg.end and seg.start <= (o_start - 0.05):
+                interrupted = seg.speaker
+
+        for seg in segments:
+            starts_near = 0 <= (o_start - seg.start) <= cut_in_window
+            active = seg.start <= o_start <= seg.end
+            if starts_near and active and seg.speaker != interrupted:
                 interrupter = seg.speaker
                 break
 
@@ -198,61 +234,35 @@ def infer_interruptions(
                 }
             )
 
-    deduped = []
+    # dedupe
     seen = set()
-    for item in interruptions:
-        key = (item["start"], item["end"], item["interrupter"], item["interrupted"])
+    out = []
+    for it in interruptions:
+        key = (it["start"], it["end"], it["interrupter"], it["interrupted"])
         if key not in seen:
             seen.add(key)
-            deduped.append(item)
+            out.append(it)
+    return out
 
-    return deduped
 
+# -------------------------
+# Diarization
+# -------------------------
 
-def run_diarization(
-    raw_bytes: bytes,
-    filename: str,
-    min_overlap_threshold: float,
-    cut_in_window: float,
-) -> dict[str, Any]:
-    """Normalize audio, diarize, then compute overlap/interruptions."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = Path(tmpdir) / (filename or "input_audio")
-        wav_path = Path(tmpdir) / "normalized.wav"
-        input_path.write_bytes(raw_bytes)
+def diarize_wav(wav_path: Path, min_overlap_threshold: float, cut_in_window: float) -> dict[str, Any]:
+    pipeline = get_diarization_pipeline()
+    diarization = pipeline(str(wav_path))
 
-        try:
-            convert_audio_bytes_to_wav16k_mono(raw_bytes, wav_path)
-        except AudioConversionError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        pipeline = get_diarization_pipeline()
-        try:
-            diarization = pipeline(str(wav_path))
-        except Exception as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Diarization model is unavailable. Confirm HF_TOKEN has access to "
-                    "pyannote/speaker-diarization-3.1 and that model terms are accepted. "
-                    f"Underlying error: {exc}"
-                ),
-            ) from exc
-
-        segments: list[Segment] = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            segments.append(
-                Segment(
-                    start=float(turn.start),
-                    end=float(turn.end),
-                    speaker=str(speaker),
-                )
-            )
+    segments: list[Segment] = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        segments.append(Segment(float(turn.start), float(turn.end), str(speaker)))
 
     segments.sort(key=lambda s: (s.start, s.end))
     speakers = sorted({s.speaker for s in segments})
     overlaps = detect_overlaps(segments, min_overlap=min_overlap_threshold)
     interruptions = infer_interruptions(segments, overlaps, cut_in_window=cut_in_window)
+    audio_duration = max((s.end for s in segments), default=0.0)
+
     return {
         "segments_obj": segments,
         "num_speakers": len(speakers),
@@ -262,66 +272,72 @@ def run_diarization(
         ],
         "overlaps": overlaps,
         "interruptions": interruptions,
+        "audio_duration": audio_duration,
     }
 
 
-def fallback_transcript_segments(full_text: str, duration_seconds: float) -> list[dict[str, Any]]:
-    """Create approximate timestamped text segments when timestamps are unavailable."""
-    chunks = [c.strip() for c in re.split(r"(?<=[.!?])\s+", full_text) if c.strip()]
-    if not chunks:
-        return []
-    if duration_seconds <= 0:
-        duration_seconds = float(len(chunks))
+# -------------------------
+# Transcription (offline: faster-whisper)
+# -------------------------
 
-    step = duration_seconds / len(chunks)
-    out = []
-    for i, text in enumerate(chunks):
-        start = i * step
-        end = duration_seconds if i == len(chunks) - 1 else (i + 1) * step
-        out.append({"start": round(start, 3), "end": round(end, 3), "text": text})
-    return out
+def get_whisper_model():
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is not None:
+        return _WHISPER_MODEL
+
+    model_size = os.getenv("WHISPER_MODEL_SIZE", "base").strip()  # base/small/medium...
+    try:
+        from faster_whisper import WhisperModel
+
+        _WHISPER_MODEL = WhisperModel(model_size, device="cpu", compute_type="int8")
+        return _WHISPER_MODEL
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not load faster-whisper model. Install faster-whisper. Error: {exc}",
+        ) from exc
 
 
-def transcribe_audio_with_openai(wav_path: Path, duration_seconds: float) -> dict[str, Any]:
-    """Transcribe audio in English with timestamps when possible."""
-    client = get_openai_client()
-    with wav_path.open("rb") as audio_file:
-        transcription = client.audio.transcriptions.create(
-            model="gpt-4o-mini-transcribe",
-            file=audio_file,
-            language="en",
-            response_format="verbose_json",
-            timestamp_granularities=["segment"],
+def transcribe_with_whisper(wav_path: Path) -> dict[str, Any]:
+    model = get_whisper_model()
+    segments_iter, _info = model.transcribe(
+        str(wav_path),
+        language="en",
+        vad_filter=True,
+    )
+
+    segments: list[dict[str, Any]] = []
+    texts = []
+    for seg in segments_iter:
+        text = (seg.text or "").strip()
+        if not text:
+            continue
+        segments.append(
+            {"start": round(float(seg.start), 3), "end": round(float(seg.end), 3), "text": text}
         )
+        texts.append(text)
 
-    text = getattr(transcription, "text", "") or ""
-    transcript_segments: list[dict[str, Any]] = []
-    for seg in getattr(transcription, "segments", []) or []:
-        transcript_segments.append(
-            {
-                "start": round(float(getattr(seg, "start", 0.0) or 0.0), 3),
-                "end": round(float(getattr(seg, "end", 0.0) or 0.0), 3),
-                "text": str(getattr(seg, "text", "") or "").strip(),
-            }
-        )
+    return {"full_text": " ".join(texts).strip(), "segments": segments}
 
-    if not transcript_segments and text.strip():
-        transcript_segments = fallback_transcript_segments(text, duration_seconds)
 
-    return {
-        "full_text": text,
-        "segments": [s for s in transcript_segments if s["text"]],
-    }
-
+# -------------------------
+# Speaker-text alignment
+# -------------------------
 
 def align_speakers_to_transcript(
-    diarization_segments: list[Segment], transcript_segments: list[dict[str, Any]]
+    diarization_segments: list[Segment],
+    transcript_segments: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Assign each transcript segment to speaker with maximum temporal overlap."""
+    """Assign each transcript segment to the diarized speaker with max temporal overlap."""
     utterances: list[dict[str, Any]] = []
+
     for tseg in transcript_segments:
         t_start = float(tseg.get("start", 0.0))
         t_end = float(tseg.get("end", t_start))
+        text = str(tseg.get("text", "")).strip()
+        if not text:
+            continue
+
         best_speaker = "UNKNOWN"
         best_overlap = 0.0
 
@@ -332,116 +348,110 @@ def align_speakers_to_transcript(
                 best_speaker = dseg.speaker
 
         utterances.append(
-            {
-                "speaker": best_speaker,
-                "start": round(t_start, 3),
-                "end": round(t_end, 3),
-                "text": str(tseg.get("text", "")).strip(),
-            }
+            {"speaker": best_speaker, "start": round(t_start, 3), "end": round(t_end, 3), "text": text}
         )
 
-    return [u for u in utterances if u["text"]]
+    return utterances
 
 
-def extract_idea_map(full_text: str, speaker_utterances: list[dict[str, Any]]) -> dict[str, Any]:
-    """Use OpenAI Responses API with strict JSON schema to build idea map."""
-    if not full_text.strip():
+# -------------------------
+# Idea map (offline: TF-IDF + clustering)
+# -------------------------
+
+def split_into_idea_sentences(text: str) -> list[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
+    parts = [p for p in parts if len(p) >= 10]
+    return parts[:300]  # safety cap
+
+
+def cluster_ideas(sentences: list[str]) -> dict[str, Any]:
+    """
+    Cluster idea sentences into "main ideas" using TF-IDF + agglomerative clustering.
+    This avoids torch/transformers completely.
+    """
+    if not sentences:
         return {"main_ideas": []}
 
-    client = get_openai_client()
+    vec = TfidfVectorizer(stop_words="english", max_features=5000, ngram_range=(1, 2))
+    X = vec.fit_transform(sentences)
 
-    schema = {
-        "name": "idea_map",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "main_ideas": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "id": {"type": "string"},
-                            "title": {"type": "string"},
-                            "summary": {"type": "string"},
-                            "sub_ideas": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "additionalProperties": False,
-                                    "properties": {
-                                        "text": {"type": "string"},
-                                        "speakers": {
-                                            "type": "array",
-                                            "items": {"type": "string"},
-                                        },
-                                        "evidence": {
-                                            "type": "array",
-                                            "items": {"type": "string"},
-                                        },
-                                    },
-                                    "required": ["text", "speakers", "evidence"],
-                                },
-                            },
-                        },
-                        "required": ["id", "title", "summary", "sub_ideas"],
-                    },
-                }
-            },
-            "required": ["main_ideas"],
-        },
-    }
-
-    prompt = (
-        "You are an English brainstorming analysis assistant. "
-        "Extract atomic ideas from this transcript, merge duplicates, and organize into a hierarchy "
-        "of main ideas and sub-ideas. Keep titles concise. Keep summaries to 1-2 sentences. "
-        "Use short evidence quotes from the transcript (not long passages). "
-        "Return JSON only matching the schema."
+    # smaller => more clusters
+    dist_thresh = float(os.getenv("IDEA_CLUSTER_DISTANCE", "0.70"))
+    clustering = AgglomerativeClustering(
+        n_clusters=None,
+        metric="cosine",
+        linkage="average",
+        distance_threshold=dist_thresh,
     )
 
-    response = client.responses.create(
-        model="gpt-4o-mini",
-        input=[
-            {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "Transcript:\n"
-                            f"{full_text}\n\n"
-                            "Speaker utterances (JSON):\n"
-                            f"{speaker_utterances}"
-                        ),
-                    }
-                ],
-            },
-        ],
-        text={"format": {"type": "json_schema", "name": schema["name"], "strict": True, "schema": schema["schema"]}},
-    )
+    # Convert to dense for sklearn clustering (safe due to cap)
+    labels = clustering.fit_predict(X.toarray()).tolist()
 
-    parsed = getattr(response, "output_parsed", None)
-    if isinstance(parsed, dict) and "main_ideas" in parsed:
-        return parsed
+    clusters: dict[int, list[int]] = {}
+    for i, lab in enumerate(labels):
+        clusters.setdefault(int(lab), []).append(i)
 
-    # Fallback parse from text body if SDK doesn't populate output_parsed.
-    text = response.output_text or ""
-    if not text.strip():
-        return {"main_ideas": []}
-    import json
+    cluster_items = sorted(clusters.items(), key=lambda kv: len(kv[1]), reverse=True)
 
-    payload = json.loads(text)
-    if isinstance(payload, dict) and "main_ideas" in payload:
-        return payload
-    return {"main_ideas": []}
+    main_ideas = []
+    for ci, (_lab, idxs) in enumerate(cluster_items, start=1):
+        # representative sentence = highest average similarity within cluster
+        subX = X[idxs]
+        sim = (subX @ subX.T).toarray()
+        rep_i = idxs[int(np.argmax(sim.mean(axis=1)))]
 
+        title = sentences[rep_i]
+        if len(title) > 80:
+            title = title[:77] + "..."
+
+        cluster_texts = [sentences[i] for i in idxs]
+        summary = cluster_texts[0]
+        if len(cluster_texts) > 1 and len(summary) < 120:
+            summary = (summary + " " + cluster_texts[1])[:250]
+
+        sub_ideas = [
+            {"text": sentences[i], "speakers": [], "evidence": [sentences[i][:120]]}
+            for i in idxs
+        ]
+
+        main_ideas.append(
+            {"id": f"I{ci}", "title": title, "summary": summary, "sub_ideas": sub_ideas[:12]}
+        )
+
+    return {"main_ideas": main_ideas[:12]}
+
+
+def attach_speakers_to_ideas(idea_map: dict[str, Any], utterances: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Simple speaker attribution:
+    - if the first 30 chars of a sub-idea appears in an utterance, attribute that speaker.
+    """
+    if not idea_map.get("main_ideas") or not utterances:
+        return idea_map
+
+    utt = [(u.get("speaker", "UNKNOWN"), (u.get("text", "") or "").lower()) for u in utterances]
+
+    for idea in idea_map["main_ideas"]:
+        for sub in idea.get("sub_ideas", []):
+            t = (sub.get("text", "") or "").lower()
+            if not t:
+                continue
+            key = t[:30]
+            speakers = {spk for spk, txt in utt if key in txt}
+            if speakers:
+                sub["speakers"] = sorted(speakers)
+
+    return idea_map
+
+
+# -------------------------
+# Scores
+# -------------------------
 
 def gini(values: list[float]) -> float:
-    """Compute Gini coefficient for non-negative values."""
     arr = [max(0.0, float(v)) for v in values]
     n = len(arr)
     if n == 0:
@@ -471,16 +481,17 @@ def compute_scores(
     overlap_ratio = (total_overlap_time / total_speaking_time) if total_speaking_time > 1e-9 else 0.0
 
     audio_duration = max((s.end for s in segments), default=0.0)
-    audio_duration_minutes = audio_duration / 60.0
-    interruptions_per_min = len(interruptions) / (audio_duration_minutes + 1e-6)
+    interruptions_per_min = len(interruptions) / ((audio_duration / 60.0) + 1e-6)
 
-    independence = 100.0 - (overlap_ratio * 80.0) - min(30.0, interruptions_per_min * 10.0)
+    independence = 100.0
+    independence -= overlap_ratio * 80.0
+    independence -= min(30.0, interruptions_per_min * 10.0)
     independence = max(0.0, min(100.0, independence))
 
-    gini_speaking_time = gini(list(speaking_times.values()))
-    participation_balance = max(0.0, min(100.0, (1.0 - gini_speaking_time) * 100.0))
+    g = gini(list(speaking_times.values()))
+    participation_balance = max(0.0, min(100.0, (1.0 - g) * 100.0))
 
-    num_main_ideas = len(idea_map.get("main_ideas", []))
+    num_main_ideas = len(idea_map.get("main_ideas", []) or [])
     idea_diversity = max(0.0, min(100.0, (num_main_ideas / 8.0) * 100.0))
 
     collective = round(0.4 * independence + 0.3 * participation_balance + 0.3 * idea_diversity, 1)
@@ -494,16 +505,40 @@ def compute_scores(
             "overlap_ratio": round(overlap_ratio, 4),
             "interruptions_per_min": round(interruptions_per_min, 3),
             "speaking_time_seconds": {k: round(v, 3) for k, v in speaking_times.items()},
-            "gini_speaking_time": round(gini_speaking_time, 4),
+            "gini_speaking_time": round(g, 4),
             "num_main_ideas": num_main_ideas,
+            "cluster_distance_threshold": float(os.getenv("IDEA_CLUSTER_DISTANCE", "0.70")),
         },
     }
 
+
+# -------------------------
+# Routes
+# -------------------------
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
+@app.get("/versions")
+def versions() -> dict[str, Any]:
+    out: dict[str, Any] = {"python": os.sys.version}
+
+    def add(pkg: str):
+        try:
+            mod = __import__(pkg)
+            out[pkg] = getattr(mod, "_version", "no __version_")
+        except Exception as e:
+            out[pkg] = f"IMPORT_ERROR: {type(e).__name__}: {e}"
+
+    add("torch")
+    add("huggingface_hub")
+    add("pyannote")
+    add("pyannote.audio")
+    add("faster_whisper")
+    add("sklearn")
+    add("numpy")
+    return out
 
 @app.post("/analyze")
 async def analyze_audio(
@@ -511,29 +546,22 @@ async def analyze_audio(
     min_overlap_threshold: float = Form(0.2),
     cut_in_window: float = Form(1.0),
 ) -> dict[str, Any]:
-    suffix = Path(file.filename or "").suffix.lower()
+    suffix = _safe_suffix(file.filename)
     if suffix and suffix not in _ALLOWED_EXTS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file extension '{suffix}'. Use one of: {sorted(_ALLOWED_EXTS)}",
-        )
+        raise HTTPException(status_code=400, detail=f"Unsupported file extension '{suffix}'.")
 
-    if min_overlap_threshold < 0:
-        raise HTTPException(status_code=400, detail="min_overlap_threshold must be >= 0")
-    if cut_in_window < 0:
-        raise HTTPException(status_code=400, detail="cut_in_window must be >= 0")
+    _require_positive("min_overlap_threshold", min_overlap_threshold)
+    _require_positive("cut_in_window", cut_in_window)
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
     try:
-        raw_bytes = await file.read()
-        if not raw_bytes:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
-        diarized = run_diarization(
-            raw_bytes=raw_bytes,
-            filename=file.filename or "input_audio",
-            min_overlap_threshold=min_overlap_threshold,
-            cut_in_window=cut_in_window,
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wav_path = Path(tmpdir) / "normalized.wav"
+            convert_audio_bytes_to_wav16k_mono(raw_bytes, wav_path)
+            diarized = diarize_wav(wav_path, min_overlap_threshold, cut_in_window)
 
         return {
             "num_speakers": diarized["num_speakers"],
@@ -542,13 +570,8 @@ async def analyze_audio(
             "overlaps": diarized["overlaps"],
             "interruptions": diarized["interruptions"],
         }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected analysis failure: {exc}",
-        ) from exc
+    except AudioConversionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/collective")
@@ -557,28 +580,16 @@ async def collective_analysis(
     min_overlap_threshold: float = Form(0.2),
     cut_in_window: float = Form(1.0),
 ) -> dict[str, Any]:
-    suffix = Path(file.filename or "").suffix.lower()
+    suffix = _safe_suffix(file.filename)
     if suffix and suffix not in _ALLOWED_EXTS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file extension '{suffix}'. Use one of: {sorted(_ALLOWED_EXTS)}",
-        )
+        raise HTTPException(status_code=400, detail=f"Unsupported file extension '{suffix}'.")
 
-    if min_overlap_threshold < 0:
-        raise HTTPException(status_code=400, detail="min_overlap_threshold must be >= 0")
-    if cut_in_window < 0:
-        raise HTTPException(status_code=400, detail="cut_in_window must be >= 0")
+    _require_positive("min_overlap_threshold", min_overlap_threshold)
+    _require_positive("cut_in_window", cut_in_window)
 
     raw_bytes = await file.read()
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
-    diarized = run_diarization(
-        raw_bytes=raw_bytes,
-        filename=file.filename or "input_audio",
-        min_overlap_threshold=min_overlap_threshold,
-        cut_in_window=cut_in_window,
-    )
 
     transcript = {"full_text": "", "segments": []}
     speaker_utterances: list[dict[str, Any]] = []
@@ -589,33 +600,43 @@ async def collective_analysis(
         with tempfile.TemporaryDirectory() as tmpdir:
             wav_path = Path(tmpdir) / "normalized.wav"
             convert_audio_bytes_to_wav16k_mono(raw_bytes, wav_path)
-            audio_duration = max((s.end for s in diarized["segments_obj"]), default=0.0)
-            transcript = transcribe_audio_with_openai(wav_path, audio_duration)
 
-        speaker_utterances = align_speakers_to_transcript(diarized["segments_obj"], transcript["segments"])
-        idea_map = extract_idea_map(transcript.get("full_text", ""), speaker_utterances)
+            diarized = diarize_wav(wav_path, min_overlap_threshold, cut_in_window)
+
+            try:
+                transcript = transcribe_with_whisper(wav_path)
+                speaker_utterances = align_speakers_to_transcript(
+                    diarized["segments_obj"], transcript["segments"]
+                )
+                sentences = split_into_idea_sentences(transcript["full_text"])
+                idea_map = attach_speakers_to_ideas(cluster_ideas(sentences), speaker_utterances)
+            except Exception as exc:
+                analysis_error = f"Transcription or idea clustering failed: {exc}"
+
+        scores = compute_scores(
+            overlaps=diarized["overlaps"],
+            interruptions=diarized["interruptions"],
+            segments=diarized["segments_obj"],
+            idea_map=idea_map,
+        )
+        if analysis_error:
+            scores["debug"]["analysis_error"] = analysis_error
+
+        return {
+            "num_speakers": diarized["num_speakers"],
+            "speakers": diarized["speakers"],
+            "segments": diarized["segments"],
+            "overlaps": diarized["overlaps"],
+            "interruptions": diarized["interruptions"],
+            "transcript": transcript,
+            "speaker_utterances": speaker_utterances,
+            "idea_map": idea_map,
+            "scores": scores,
+        }
+
+    except AudioConversionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except HTTPException:
         raise
     except Exception as exc:
-        analysis_error = f"Transcription or idea extraction failed: {exc}"
-
-    scores = compute_scores(
-        overlaps=diarized["overlaps"],
-        interruptions=diarized["interruptions"],
-        segments=diarized["segments_obj"],
-        idea_map=idea_map,
-    )
-    if analysis_error:
-        scores.setdefault("debug", {})["analysis_error"] = analysis_error
-
-    return {
-        "num_speakers": diarized["num_speakers"],
-        "speakers": diarized["speakers"],
-        "segments": diarized["segments"],
-        "overlaps": diarized["overlaps"],
-        "interruptions": diarized["interruptions"],
-        "transcript": transcript,
-        "speaker_utterances": speaker_utterances,
-        "idea_map": idea_map,
-        "scores": scores,
-    }
+        raise HTTPException(status_code=500, detail=f"Unexpected analysis failure: {exc}") from exc
