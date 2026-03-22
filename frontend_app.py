@@ -115,6 +115,8 @@ h1, h2, h3, h4, h5, h6, p, span, label, div {
 .stTextInput input,
 .stNumberInput input,
 .stTextArea textarea,
+div[data-testid="stTextArea"] textarea,
+div[data-testid="stTextArea"] textarea:disabled,
 .stSelectbox div[data-baseweb="select"],
 .stMultiSelect div[data-baseweb="select"],
 .stFileUploader,
@@ -129,10 +131,18 @@ h1, h2, h3, h4, h5, h6, p, span, label, div {
 
 .stTextInput input,
 .stNumberInput input,
-.stTextArea textarea {
-    background: rgba(255,255,255,0.05) !important;
+.stTextArea textarea,
+div[data-testid="stTextArea"] textarea,
+div[data-testid="stTextArea"] textarea:disabled {
+    background: rgba(12, 20, 38, 0.92) !important;
     border: 1px solid var(--border) !important;
     color: var(--text) !important;
+    -webkit-text-fill-color: var(--text) !important;
+    caret-color: var(--text) !important;
+}
+
+div[data-testid="stTextArea"] textarea::placeholder {
+    color: var(--muted) !important;
 }
 
 [data-baseweb="tab-list"] {
