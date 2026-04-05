@@ -365,8 +365,39 @@ def split_into_idea_sentences(text: str) -> list[str]:
     if not text:
         return []
     parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
-    parts = [p for p in parts if len(p) >= 10]
+    parts = [p for p in parts if len(p) >= 10 and is_meaningful_idea_text(p)]
     return parts[:300]  # safety cap
+
+
+def is_meaningful_idea_text(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    t_low = t.lower()
+    if len(t_low) < 14:
+        return False
+
+    non_idea_patterns = [
+        r"^\s*(no|nope|nah)\s*[,.\-]?\s*(actually|wait)?\s*$",
+        r"^\s*(yes|yeah|yep|ok|okay|sure|right|got it|cool|thanks?|thank you)\s*[.!]*\s*$",
+        r"^\s*(hello|hi|good morning|good afternoon|good evening)\b",
+        r"^\s*(i agree|sounds good|that makes sense)\s*[.!]*\s*$",
+    ]
+    if any(re.match(pat, t_low) for pat in non_idea_patterns):
+        return False
+
+    words = re.findall(r"[a-zA-Z0-9']+", t_low)
+    if len(words) < 4:
+        return False
+
+    idea_keywords = {
+        "should", "need", "plan", "proposal", "propose", "build", "create", "launch",
+        "improve", "reduce", "increase", "risk", "issue", "problem", "solution",
+        "decision", "decide", "opportunity", "strategy", "timeline", "budget",
+        "customer", "market", "feature", "process", "workflow",
+    }
+    return bool(idea_keywords.intersection(words))
 
 
 def cluster_ideas(sentences: list[str]) -> dict[str, Any]:
@@ -414,10 +445,15 @@ def cluster_ideas(sentences: list[str]) -> dict[str, Any]:
         if len(cluster_texts) > 1 and len(summary) < 120:
             summary = (summary + " " + cluster_texts[1])[:250]
 
-        sub_ideas = [
-            {"text": sentences[i], "speakers": [], "evidence": [sentences[i][:120]]}
-            for i in idxs
-        ]
+        sub_ideas = []
+        for i in idxs:
+            sub_text = sentences[i]
+            if not is_meaningful_idea_text(sub_text):
+                continue
+            sub_ideas.append({"text": sub_text, "speakers": [], "evidence": [sub_text[:120]]})
+
+        if not sub_ideas:
+            continue
 
         main_ideas.append(
             {"id": f"I{ci}", "title": title, "summary": summary, "sub_ideas": sub_ideas[:12]}
@@ -426,7 +462,10 @@ def cluster_ideas(sentences: list[str]) -> dict[str, Any]:
     return {"main_ideas": main_ideas[:12]}
 
 
-def extract_ideas_with_llama(full_text: str) -> dict[str, Any]:
+def extract_ideas_with_llama(
+    full_text: str,
+    speaker_utterances: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """
     Use Groq-hosted Llama model to extract structured main ideas + sub-ideas.
     Falls back to offline clustering when API key is missing or request fails.
@@ -440,6 +479,21 @@ def extract_ideas_with_llama(full_text: str) -> dict[str, Any]:
         raise RuntimeError("Missing GROQ_API_KEY")
 
     model = os.getenv("IDEA_MODEL_NAME", "llama-3.3-70b-versatile").strip()
+
+    utterances = speaker_utterances or []
+    transcript_lines: list[str] = []
+    for u in utterances[:500]:
+        speaker = str(u.get("speaker", "UNKNOWN")).strip() or "UNKNOWN"
+        start = float(u.get("start", 0.0) or 0.0)
+        end = float(u.get("end", start) or start)
+        seg_text = str(u.get("text", "")).strip()
+        if not seg_text:
+            continue
+        transcript_lines.append(f"[{start:.1f}-{end:.1f}] {speaker}: {seg_text}")
+
+    transcript_payload = "\n".join(transcript_lines).strip()
+    if not transcript_payload:
+        transcript_payload = text
 
     prompt = (
         "Extract the conversation's core ideas as strict JSON only.\n"
@@ -463,9 +517,13 @@ def extract_ideas_with_llama(full_text: str) -> dict[str, Any]:
         "Rules:\n"
         "- 3 to 8 main ideas max.\n"
         "- 1 to 6 sub_ideas per main idea.\n"
+        "- A valid idea is a concrete proposal, suggestion, strategy, decision, challenge, risk, or opportunity.\n"
+        "- Do NOT output filler or meta-conversation as ideas (e.g., greetings, acknowledgements, thanks, yes/no-only turns, jokes, small talk).\n"
+        "- Each sub_idea.text must be actionable and specific.\n"
+        "- Use short evidence quotes that directly support the idea.\n"
         "- No markdown, no explanation, JSON only.\n"
         "- Keep concise and factual.\n\n"
-        f"Conversation transcript:\n{text[:14000]}"
+        f"Conversation transcript:\n{transcript_payload[:14000]}"
     )
 
     try:
@@ -524,6 +582,9 @@ def extract_ideas_with_llama(full_text: str) -> dict[str, Any]:
                 speakers = sub.get("speakers", [])
                 if not isinstance(speakers, list):
                     speakers = []
+                if not is_meaningful_idea_text(sub_text):
+                    continue
+
                 sub_ideas.append(
                     {
                         "text": sub_text[:300],
@@ -531,6 +592,12 @@ def extract_ideas_with_llama(full_text: str) -> dict[str, Any]:
                         "evidence": [str(e).strip()[:180] for e in evidence if str(e).strip()][:3],
                     }
                 )
+
+        if not sub_ideas and (len(summary) < 20 or not is_meaningful_idea_text(summary)):
+            continue
+
+        if not is_meaningful_idea_text(title):
+            title = (sub_ideas[0]["text"][:80] + "...") if sub_ideas else f"Idea {i}"
 
         cleaned.append(
             {
@@ -714,6 +781,7 @@ async def collective_analysis(
     transcript = {"full_text": "", "segments": []}
     speaker_utterances: list[dict[str, Any]] = []
     idea_map = {"main_ideas": []}
+    idea_map_meta: dict[str, Any] = {"source": "none"}
     analysis_error: str | None = None
 
     try:
@@ -729,10 +797,15 @@ async def collective_analysis(
                     diarized["segments_obj"], transcript["segments"]
                 )
                 try:
-                    idea_map = extract_ideas_with_llama(transcript["full_text"])
+                    idea_map = extract_ideas_with_llama(
+                        transcript["full_text"],
+                        speaker_utterances=speaker_utterances,
+                    )
+                    idea_map_meta = {"source": "llama-3.3-70b-versatile"}
                 except Exception:
                     sentences = split_into_idea_sentences(transcript["full_text"])
                     idea_map = cluster_ideas(sentences)
+                    idea_map_meta = {"source": "offline-clustering"}
                 idea_map = attach_speakers_to_ideas(idea_map, speaker_utterances)
             except Exception as exc:
                 analysis_error = f"Transcription or idea clustering failed: {exc}"
@@ -755,6 +828,7 @@ async def collective_analysis(
             "transcript": transcript,
             "speaker_utterances": speaker_utterances,
             "idea_map": idea_map,
+            "idea_map_meta": idea_map_meta,
             "scores": scores,
         }
 
