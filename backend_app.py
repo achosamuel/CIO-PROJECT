@@ -19,6 +19,7 @@ Notes:
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import re
 import tempfile
@@ -57,6 +58,7 @@ _ALLOWED_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
 # Caches (loaded once, reused)
 _PIPELINE: Any | None = None
 _WHISPER_MODEL = None
+_GROQ_CHAT_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 
 # -------------------------
@@ -424,6 +426,124 @@ def cluster_ideas(sentences: list[str]) -> dict[str, Any]:
     return {"main_ideas": main_ideas[:12]}
 
 
+def extract_ideas_with_llama(full_text: str) -> dict[str, Any]:
+    """
+    Use Groq-hosted Llama model to extract structured main ideas + sub-ideas.
+    Falls back to offline clustering when API key is missing or request fails.
+    """
+    text = (full_text or "").strip()
+    if not text:
+        return {"main_ideas": []}
+
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing GROQ_API_KEY")
+
+    model = os.getenv("IDEA_MODEL_NAME", "llama-3.3-70b-versatile").strip()
+
+    prompt = (
+        "Extract the conversation's core ideas as strict JSON only.\n"
+        "Return an object with this schema:\n"
+        "{\n"
+        '  "main_ideas": [\n'
+        "    {\n"
+        '      "id": "I1",\n'
+        '      "title": "short title",\n'
+        '      "summary": "1-2 sentence summary",\n'
+        '      "sub_ideas": [\n'
+        "        {\n"
+        '          "text": "specific supporting point",\n'
+        '          "speakers": [],\n'
+        '          "evidence": ["short quote or clue"]\n'
+        "        }\n"
+        "      ]\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "Rules:\n"
+        "- 3 to 8 main ideas max.\n"
+        "- 1 to 6 sub_ideas per main idea.\n"
+        "- No markdown, no explanation, JSON only.\n"
+        "- Keep concise and factual.\n\n"
+        f"Conversation transcript:\n{text[:14000]}"
+    )
+
+    try:
+        import requests
+    except Exception as exc:
+        raise RuntimeError(f"requests import failed: {exc}") from exc
+
+    resp = requests.post(
+        _GROQ_CHAT_ENDPOINT,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": "You output strict JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+        },
+        timeout=45,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    content = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+    ).strip()
+    if not content:
+        raise RuntimeError("LLM returned empty content")
+
+    parsed = json.loads(content)
+    main_ideas = parsed.get("main_ideas", [])
+    if not isinstance(main_ideas, list):
+        raise RuntimeError("Invalid JSON schema: main_ideas must be a list")
+
+    cleaned = []
+    for i, idea in enumerate(main_ideas[:12], start=1):
+        if not isinstance(idea, dict):
+            continue
+        title = str(idea.get("title", f"Idea {i}")).strip()[:160]
+        summary = str(idea.get("summary", "")).strip()[:500]
+        sub_ideas_raw = idea.get("sub_ideas", [])
+        sub_ideas = []
+        if isinstance(sub_ideas_raw, list):
+            for sub in sub_ideas_raw[:12]:
+                if not isinstance(sub, dict):
+                    continue
+                sub_text = str(sub.get("text", "")).strip()
+                if not sub_text:
+                    continue
+                evidence = sub.get("evidence", [])
+                if not isinstance(evidence, list):
+                    evidence = []
+                speakers = sub.get("speakers", [])
+                if not isinstance(speakers, list):
+                    speakers = []
+                sub_ideas.append(
+                    {
+                        "text": sub_text[:300],
+                        "speakers": [str(s).strip()[:40] for s in speakers if str(s).strip()],
+                        "evidence": [str(e).strip()[:180] for e in evidence if str(e).strip()][:3],
+                    }
+                )
+
+        cleaned.append(
+            {
+                "id": f"I{i}",
+                "title": title or f"Idea {i}",
+                "summary": summary,
+                "sub_ideas": sub_ideas,
+            }
+        )
+
+    return {"main_ideas": cleaned}
+
+
 def attach_speakers_to_ideas(idea_map: dict[str, Any], utterances: list[dict[str, Any]]) -> dict[str, Any]:
     """
     Simple speaker attribution:
@@ -608,8 +728,12 @@ async def collective_analysis(
                 speaker_utterances = align_speakers_to_transcript(
                     diarized["segments_obj"], transcript["segments"]
                 )
-                sentences = split_into_idea_sentences(transcript["full_text"])
-                idea_map = attach_speakers_to_ideas(cluster_ideas(sentences), speaker_utterances)
+                try:
+                    idea_map = extract_ideas_with_llama(transcript["full_text"])
+                except Exception:
+                    sentences = split_into_idea_sentences(transcript["full_text"])
+                    idea_map = cluster_ideas(sentences)
+                idea_map = attach_speakers_to_ideas(idea_map, speaker_utterances)
             except Exception as exc:
                 analysis_error = f"Transcription or idea clustering failed: {exc}"
 
