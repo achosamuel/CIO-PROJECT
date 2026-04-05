@@ -848,11 +848,17 @@ with tabs[2]:
         render_empty_state("🧠", "Idea map unavailable", "Collective mode is required to extract clustered ideas.")
     else:
         idea_map = result.get("idea_map", {}) or {}
+        idea_map_meta = result.get("idea_map_meta", {}) or {}
         main_ideas = idea_map.get("main_ideas", []) or []
 
         if not main_ideas:
             render_empty_state("💡", "No ideas extracted", "Try a longer brainstorming audio clip, ideally 30 to 90 seconds.")
         else:
+            source = idea_map_meta.get("source", "unknown")
+            st.caption(f"Ideas are extracted from the full transcript and filtered to hide conversational filler. Source: {source}.")
+            if source == "offline-clustering":
+                reason = idea_map_meta.get("fallback_reason", "Llama request failed.")
+                st.warning(f"Using offline clustering fallback. Reason: {reason}")
             st.markdown("### Main ideas")
             for index, idea in enumerate(main_ideas, start=1):
                 title = idea.get("title", f"Idea {index}")
@@ -865,14 +871,16 @@ with tabs[2]:
                     if not sub_ideas:
                         st.caption("No sub-ideas available.")
                     else:
-                        rows = [
-                            {
-                                "sub_idea": s.get("text", ""),
-                                "speakers": ", ".join(s.get("speakers", []) or []),
-                                "evidence": (s.get("evidence", [""]) or [""])[0],
-                            }
-                            for s in sub_ideas
-                        ]
+                        rows = []
+                        for s in sub_ideas:
+                            evidences = s.get("evidence", []) or []
+                            rows.append(
+                                {
+                                    "sub_idea": s.get("text", ""),
+                                    "speakers": ", ".join(s.get("speakers", []) or []),
+                                    "evidence": " | ".join(evidences[:2]),
+                                }
+                            )
                         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 with tabs[3]:
