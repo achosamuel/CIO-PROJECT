@@ -853,6 +853,7 @@ with tabs[2]:
         if not main_ideas:
             render_empty_state("💡", "No ideas extracted", "Try a longer brainstorming audio clip, ideally 30 to 90 seconds.")
         else:
+            st.caption("Ideas are extracted from the full transcript with Llama and filtered to hide conversational filler.")
             st.markdown("### Main ideas")
             for index, idea in enumerate(main_ideas, start=1):
                 title = idea.get("title", f"Idea {index}")
@@ -865,14 +866,16 @@ with tabs[2]:
                     if not sub_ideas:
                         st.caption("No sub-ideas available.")
                     else:
-                        rows = [
-                            {
-                                "sub_idea": s.get("text", ""),
-                                "speakers": ", ".join(s.get("speakers", []) or []),
-                                "evidence": (s.get("evidence", [""]) or [""])[0],
-                            }
-                            for s in sub_ideas
-                        ]
+                        rows = []
+                        for s in sub_ideas:
+                            evidences = s.get("evidence", []) or []
+                            rows.append(
+                                {
+                                    "sub_idea": s.get("text", ""),
+                                    "speakers": ", ".join(s.get("speakers", []) or []),
+                                    "evidence": " | ".join(evidences[:2]),
+                                }
+                            )
                         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 with tabs[3]:
