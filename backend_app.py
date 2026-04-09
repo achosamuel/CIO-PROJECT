@@ -9,6 +9,7 @@ Pipeline:
 
 Run (PowerShell):
   $env:HF_TOKEN="hf_iRzVdteghGHWYljbOQYAmPOJaYJM"
+  $env:GROQ_API_KEY="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"
   uvicorn backend_app:app --host 127.0.0.1 --port 8000 --reload
 
 Notes:
