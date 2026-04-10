@@ -5,16 +5,12 @@ Pipeline:
 - Normalize audio to WAV 16k mono (utils_audio.py)
 - Speaker diarization (pyannote) using HF_TOKEN
 - Transcription (offline) using faster-whisper
-- Idea map (offline) using TF-IDF + clustering (no torch / no transformers)
+- Speaker name inference: real names extracted from transcript instead of SPEAKER_00
+- Idea map via Groq-hosted Llama 3.3 70B (full transcript, no truncation)
+  with TF-IDF clustering as offline fallback
 
 Run (PowerShell):
-  $env:HF_TOKEN="hf_iRzVdteghGHWYljbOQYAmPOJaYJM"
-  $env:GROQ_API_KEY="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"
   uvicorn backend_app:app --host 127.0.0.1 --port 8000 --reload
-
-Notes:
-- Requires FFmpeg available on PATH (used by utils_audio conversion).
-- Requires you accepted the model conditions for pyannote/speaker-diarization-3.1 on Hugging Face.
 """
 
 from __future__ import annotations
@@ -48,6 +44,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:8501",
         "http://127.0.0.1:8501",
+        "https://id-preview--7b3df4b1-7a21-406a-8ddf-a1bfdc3c5a50.lovable.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -87,17 +84,195 @@ def _safe_suffix(filename: str | None) -> str:
 
 
 # -------------------------
+# Speaker name inference
+# -------------------------
+
+# Common filler/non-name words to reject when scanning first-word fallback
+_NON_NAME_WORDS = frozenset({
+    "i", "the", "a", "an", "so", "well", "yeah", "yes", "no", "ok", "okay",
+    "hi", "hey", "hello", "good", "great", "right", "sure", "thanks", "thank",
+    "let", "just", "we", "it", "is", "my", "our", "its", "um", "uh", "like",
+    "and", "but", "or", "if", "of", "to", "in", "on", "at", "by", "for",
+})
+
+# Patterns for self-introduction: "I'm John", "I am Sarah", "My name is Alex"
+_INTRO_PATTERNS = [
+    re.compile(r"\bI'?m\s+([A-Z][a-z]{1,20})\b"),
+    re.compile(r"\bI\s+am\s+([A-Z][a-z]{1,20})\b"),
+    re.compile(r"\bmy\s+name(?:'?s|\s+is)\s+([A-Z][a-z]{1,20})\b", re.IGNORECASE),
+    re.compile(r"\bthis\s+is\s+([A-Z][a-z]{1,20})\b"),
+    re.compile(r"\bcall\s+me\s+([A-Z][a-z]{1,20})\b", re.IGNORECASE),
+]
+
+# Patterns for being addressed: "John, what do you think?" or "Thanks, Sarah."
+# Captures a name that appears at the very start or end of an utterance (vocative)
+_VOCATIVE_PATTERN = re.compile(
+    r"(?:^|[,\.!?]\s*)([A-Z][a-z]{1,20})\s*[,\.!?]|[,\.!?]\s*([A-Z][a-z]{1,20})\s*[,\.!?]?$"
+)
+
+
+def infer_speaker_names(
+    utterances: list[dict[str, Any]],
+) -> dict[str, str]:
+    """
+    Attempt to infer a real first name for each diarized speaker label.
+
+    Strategy (in priority order):
+    1. Self-introduction patterns ("I'm John", "My name is Sarah") in the
+       speaker's own utterances.
+    2. Vocative address patterns — another speaker says "Hey John," or
+       "Thanks, Sarah" — the addressed name is attributed to the silent speaker
+       who was most recently active when the address occurred.
+    3. First capitalised word of the speaker's first utterance that is not a
+       stop-word / filler, used only when confidence is high (len >= 3, title-case).
+    4. Fall back to the original label if nothing is found.
+
+    Returns a mapping {original_label: display_name}.
+    """
+    if not utterances:
+        return {}
+
+    # Build ordered list of unique speakers
+    all_speakers: list[str] = []
+    seen: set[str] = set()
+    for u in utterances:
+        spk = u.get("speaker", "UNKNOWN")
+        if spk not in seen:
+            seen.add(spk)
+            all_speakers.append(spk)
+
+    name_map: dict[str, str] = {spk: spk for spk in all_speakers}
+    confidence: dict[str, int] = {spk: 0 for spk in all_speakers}  # higher = more certain
+
+    # Pass 1 — self-introductions (highest confidence = 3)
+    for u in utterances:
+        spk = u.get("speaker", "UNKNOWN")
+        text = u.get("text", "") or ""
+        for pat in _INTRO_PATTERNS:
+            m = pat.search(text)
+            if m:
+                candidate = m.group(1).strip()
+                if len(candidate) >= 2 and confidence[spk] < 3:
+                    name_map[spk] = candidate
+                    confidence[spk] = 3
+                break
+
+    # Pass 2 — vocative address (confidence = 2)
+    # When speaker A addresses "John,", the name likely belongs to another speaker
+    # We attribute it to the last active speaker that is NOT speaker A.
+    last_active: dict[str, float] = {spk: -1.0 for spk in all_speakers}
+    for u in utterances:
+        spk = u.get("speaker", "UNKNOWN")
+        t_start = float(u.get("start", 0.0))
+        text = u.get("text", "") or ""
+
+        for m in _VOCATIVE_PATTERN.finditer(text):
+            candidate = (m.group(1) or m.group(2) or "").strip()
+            if not candidate or len(candidate) < 2:
+                continue
+            # Find the speaker whose label we haven't resolved yet and was recently active
+            for other_spk in all_speakers:
+                if other_spk == spk:
+                    continue
+                recently = (last_active[other_spk] >= 0) and (t_start - last_active[other_spk] < 30.0)
+                if recently and confidence[other_spk] < 2:
+                    name_map[other_spk] = candidate
+                    confidence[other_spk] = 2
+                    break
+
+        last_active[spk] = t_start
+
+    # Pass 3 — first capitalised word of first utterance (confidence = 1)
+    first_seen: set[str] = set()
+    for u in utterances:
+        spk = u.get("speaker", "UNKNOWN")
+        if spk in first_seen:
+            continue
+        first_seen.add(spk)
+        if confidence[spk] > 0:
+            continue
+        text = (u.get("text", "") or "").strip()
+        words = text.split()
+        for word in words[:6]:  # only look at first 6 words
+            clean = re.sub(r"[^A-Za-z]", "", word)
+            if (
+                len(clean) >= 3
+                and clean[0].isupper()
+                and clean.lower() not in _NON_NAME_WORDS
+            ):
+                name_map[spk] = clean
+                confidence[spk] = 1
+                break
+
+    # Deduplicate: if two speakers got the same inferred name, keep only the
+    # one with higher confidence; reset the other to its original label.
+    used_names: dict[str, str] = {}  # name -> speaker with highest confidence
+    for spk in all_speakers:
+        name = name_map[spk]
+        if name == spk:
+            continue  # still original label, no conflict possible
+        if name not in used_names:
+            used_names[name] = spk
+        else:
+            existing_spk = used_names[name]
+            if confidence[spk] >= confidence[existing_spk]:
+                # Current speaker wins, reset existing
+                name_map[existing_spk] = existing_spk
+                used_names[name] = spk
+            else:
+                # Existing wins, reset current
+                name_map[spk] = spk
+
+    return name_map
+
+
+def apply_speaker_names(
+    name_map: dict[str, str],
+    *,
+    segments: list[dict[str, Any]] | None = None,
+    utterances: list[dict[str, Any]] | None = None,
+    overlaps: list[dict[str, Any]] | None = None,
+    interruptions: list[dict[str, Any]] | None = None,
+    idea_map: dict[str, Any] | None = None,
+) -> None:
+    """
+    In-place rename all speaker labels across every output structure.
+    Mutates the objects directly so callers don't need to reassemble them.
+    """
+    if not name_map:
+        return
+
+    def remap(label: str) -> str:
+        return name_map.get(label, label)
+
+    if segments:
+        for seg in segments:
+            seg["speaker"] = remap(seg.get("speaker", ""))
+
+    if utterances:
+        for u in utterances:
+            u["speaker"] = remap(u.get("speaker", ""))
+
+    if overlaps:
+        for ov in overlaps:
+            ov["speakers"] = [remap(s) for s in ov.get("speakers", [])]
+
+    if interruptions:
+        for it in interruptions:
+            it["interrupter"] = remap(it.get("interrupter", ""))
+            it["interrupted"] = remap(it.get("interrupted", ""))
+
+    if idea_map:
+        for idea in idea_map.get("main_ideas", []):
+            for sub in idea.get("sub_ideas", []):
+                sub["speakers"] = [remap(s) for s in sub.get("speakers", [])]
+
+
+# -------------------------
 # HF + pyannote diarization
 # -------------------------
 
 def get_diarization_pipeline() -> Any:
-    """
-    Load/cached pyannote pipeline with HF token.
-
-    This tries to be robust across pyannote/hub versions by:
-    - Passing auth token directly to Pipeline.from_pretrained when supported.
-    - Falling back to huggingface_hub.login if needed.
-    """
     global _PIPELINE
     if _PIPELINE is not None:
         return _PIPELINE
@@ -115,15 +290,12 @@ def get_diarization_pipeline() -> Any:
     try:
         from pyannote.audio import Pipeline
 
-        # Some versions support: Pipeline.from_pretrained(..., token=...)
-        # Others: use_auth_token=...
         sig = inspect.signature(Pipeline.from_pretrained)
         if "token" in sig.parameters:
             _PIPELINE = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
         elif "use_auth_token" in sig.parameters:
             _PIPELINE = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
         else:
-            # Last resort: login then load
             from huggingface_hub import login
             login(token=token)
             _PIPELINE = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
@@ -145,7 +317,6 @@ def get_diarization_pipeline() -> Any:
 # -------------------------
 
 def merge_overlap_events(overlap_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Merge overlap windows that intersect/touch and combine speaker sets."""
     if not overlap_events:
         return []
 
@@ -176,7 +347,6 @@ def merge_overlap_events(overlap_events: list[dict[str, Any]]) -> list[dict[str,
 
 
 def detect_overlaps(segments: list[Segment], min_overlap: float = 0.2) -> list[dict[str, Any]]:
-    """Find overlap windows across different-speaker segments."""
     events: list[dict[str, Any]] = []
     n = len(segments)
 
@@ -199,13 +369,6 @@ def infer_interruptions(
     overlaps: list[dict[str, Any]],
     cut_in_window: float = 1.0,
 ) -> list[dict[str, Any]]:
-    """
-    Infer interruptions from overlap windows.
-
-    Heuristic:
-    - interrupted speaker: already speaking just before overlap start
-    - interrupter: starts within cut_in_window of overlap start and is active at overlap start
-    """
     interruptions: list[dict[str, Any]] = []
 
     for overlap in overlaps:
@@ -234,10 +397,10 @@ def infer_interruptions(
                     "interrupter": interrupter,
                     "interrupted": interrupted,
                     "overlap_duration": round(o_end - o_start, 3),
+                    "timestamp": round(o_start, 3),  # Added this line
                 }
             )
 
-    # dedupe
     seen = set()
     out = []
     for it in interruptions:
@@ -288,7 +451,7 @@ def get_whisper_model():
     if _WHISPER_MODEL is not None:
         return _WHISPER_MODEL
 
-    model_size = os.getenv("WHISPER_MODEL_SIZE", "base").strip()  # base/small/medium...
+    model_size = os.getenv("WHISPER_MODEL_SIZE", "base").strip()
     try:
         from faster_whisper import WhisperModel
 
@@ -331,7 +494,6 @@ def align_speakers_to_transcript(
     diarization_segments: list[Segment],
     transcript_segments: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Assign each transcript segment to the diarized speaker with max temporal overlap."""
     utterances: list[dict[str, Any]] = []
 
     for tseg in transcript_segments:
@@ -358,7 +520,7 @@ def align_speakers_to_transcript(
 
 
 # -------------------------
-# Idea map (offline: TF-IDF + clustering)
+# Idea map (offline: TF-IDF + clustering) — fallback only
 # -------------------------
 
 def split_into_idea_sentences(text: str) -> list[str]:
@@ -367,13 +529,13 @@ def split_into_idea_sentences(text: str) -> list[str]:
         return []
     parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
     parts = [p for p in parts if len(p) >= 10]
-    return parts[:300]  # safety cap
+    return parts[:300]
 
 
 def cluster_ideas(sentences: list[str]) -> dict[str, Any]:
     """
-    Cluster idea sentences into "main ideas" using TF-IDF + agglomerative clustering.
-    This avoids torch/transformers completely.
+    Offline fallback: TF-IDF + agglomerative clustering.
+    No torch / no transformers.
     """
     if not sentences:
         return {"main_ideas": []}
@@ -381,7 +543,6 @@ def cluster_ideas(sentences: list[str]) -> dict[str, Any]:
     vec = TfidfVectorizer(stop_words="english", max_features=5000, ngram_range=(1, 2))
     X = vec.fit_transform(sentences)
 
-    # smaller => more clusters
     dist_thresh = float(os.getenv("IDEA_CLUSTER_DISTANCE", "0.70"))
     clustering = AgglomerativeClustering(
         n_clusters=None,
@@ -390,7 +551,6 @@ def cluster_ideas(sentences: list[str]) -> dict[str, Any]:
         distance_threshold=dist_thresh,
     )
 
-    # Convert to dense for sklearn clustering (safe due to cap)
     labels = clustering.fit_predict(X.toarray()).tolist()
 
     clusters: dict[int, list[int]] = {}
@@ -401,7 +561,6 @@ def cluster_ideas(sentences: list[str]) -> dict[str, Any]:
 
     main_ideas = []
     for ci, (_lab, idxs) in enumerate(cluster_items, start=1):
-        # representative sentence = highest average similarity within cluster
         subX = X[idxs]
         sim = (subX @ subX.T).toarray()
         rep_i = idxs[int(np.argmax(sim.mean(axis=1)))]
@@ -427,13 +586,50 @@ def cluster_ideas(sentences: list[str]) -> dict[str, Any]:
     return {"main_ideas": main_ideas[:12]}
 
 
+# -------------------------
+# Idea map via Llama 3.3 70B (full transcript, no truncation)
+# -------------------------
+
+def _build_transcript_payload(
+    speaker_utterances: list[dict[str, Any]],
+    full_text: str,
+) -> str:
+    """
+    Build the transcript string sent to the LLM.
+
+    Preference: speaker-labelled utterances (most informative for idea attribution).
+    Fallback: raw full_text if utterances are empty.
+
+    No length truncation — we send the full conversation so the model can
+    distinguish meta-talk (greetings, acknowledgements) from real ideas.
+    """
+    lines: list[str] = []
+    for u in speaker_utterances:
+        speaker = str(u.get("speaker", "UNKNOWN")).strip() or "UNKNOWN"
+        start = float(u.get("start", 0.0) or 0.0)
+        end = float(u.get("end", start) or start)
+        text = str(u.get("text", "")).strip()
+        if text:
+            lines.append(f"[{start:.1f}-{end:.1f}] {speaker}: {text}")
+
+    return "\n".join(lines).strip() or full_text.strip()
+
+
 def extract_ideas_with_llama(
     full_text: str,
     speaker_utterances: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
-    Use Groq-hosted Llama model to extract structured main ideas + sub-ideas.
-    Falls back to offline clustering when API key is missing or request fails.
+    Use Groq-hosted Llama 3.3 70B to extract a structured idea map from the
+    COMPLETE transcript (no truncation).
+
+    The system prompt explicitly instructs the model to:
+    - Ignore greetings, small talk, filler, acknowledgements.
+    - Only surface concrete proposals, decisions, risks, strategies, or opportunities.
+    - Return strict JSON, nothing else.
+
+    Falls back to offline TF-IDF clustering when GROQ_API_KEY is absent or
+    the request fails.
     """
     text = (full_text or "").strip()
     if not text:
@@ -445,50 +641,53 @@ def extract_ideas_with_llama(
 
     model = os.getenv("IDEA_MODEL_NAME", "llama-3.3-70b-versatile").strip()
 
-    utterances = speaker_utterances or []
-    transcript_lines: list[str] = []
-    for u in utterances[:500]:
-        speaker = str(u.get("speaker", "UNKNOWN")).strip() or "UNKNOWN"
-        start = float(u.get("start", 0.0) or 0.0)
-        end = float(u.get("end", start) or start)
-        seg_text = str(u.get("text", "")).strip()
-        if not seg_text:
-            continue
-        transcript_lines.append(f"[{start:.1f}-{end:.1f}] {speaker}: {seg_text}")
+    transcript_payload = _build_transcript_payload(
+        speaker_utterances or [],
+        full_text,
+    )
 
-    transcript_payload = "\n".join(transcript_lines).strip()
-    if not transcript_payload:
-        transcript_payload = text
-
-    prompt = (
-        "Extract the conversation's core ideas as strict JSON only.\n"
-        "Return an object with this schema:\n"
+    # ---------------------------------------------------------------
+    # System prompt — strict JSON schema + noise-filtering instructions
+    # ---------------------------------------------------------------
+    system_prompt = (
+        "You are a precise meeting analyst. Your only output is a valid JSON object — "
+        "no markdown, no prose, no explanation, no code fences.\n\n"
+        "You receive a meeting transcript with timestamped speaker turns. "
+        "Your task: extract the real ideas discussed.\n\n"
+        "STRICT RULES:\n"
+        "1. A valid idea is a concrete proposal, suggestion, strategy, decision, challenge, "
+        "risk, or opportunity that was actually discussed in depth.\n"
+        "2. NEVER include: greetings (hi, hello, good morning), farewells, small talk, "
+        "filler words (yeah, ok, right, sure), acknowledgements (thanks, got it), "
+        "one-word or one-phrase turns with no substance, or meta-conversation about the meeting itself.\n"
+        "3. Sub-ideas must be specific and actionable. Minimum 15 characters. No filler.\n"
+        "4. Evidence quotes must be verbatim short excerpts from the transcript.\n"
+        "5. 3 to 8 main ideas total. 1 to 6 sub_ideas each.\n"
+        "6. Output ONLY the JSON object below — nothing before or after it.\n\n"
+        "JSON schema:\n"
         "{\n"
         '  "main_ideas": [\n'
         "    {\n"
         '      "id": "I1",\n'
-        '      "title": "short title",\n'
-        '      "summary": "1-2 sentence summary",\n'
+        '      "title": "Short title (max 80 chars)",\n'
+        '      "summary": "1-2 sentence summary of the idea",\n'
         '      "sub_ideas": [\n'
         "        {\n"
-        '          "text": "specific supporting point",\n'
-        '          "speakers": [],\n'
-        '          "evidence": ["short quote or clue"]\n'
+        '          "text": "Specific actionable point",\n'
+        '          "speakers": ["SpeakerName"],\n'
+        '          "evidence": ["short verbatim quote"]\n'
         "        }\n"
         "      ]\n"
         "    }\n"
         "  ]\n"
-        "}\n"
-        "Rules:\n"
-        "- 3 to 8 main ideas max.\n"
-        "- 1 to 6 sub_ideas per main idea.\n"
-        "- A valid idea is a concrete proposal, suggestion, strategy, decision, challenge, risk, or opportunity.\n"
-        "- Do NOT output filler or meta-conversation as ideas (e.g., greetings, acknowledgements, thanks, yes/no-only turns, jokes, small talk).\n"
-        "- Each sub_idea.text must be actionable and specific.\n"
-        "- Use short evidence quotes that directly support the idea.\n"
-        "- No markdown, no explanation, JSON only.\n"
-        "- Keep concise and factual.\n\n"
-        f"Conversation transcript:\n{transcript_payload[:14000]}"
+        "}"
+    )
+
+    user_prompt = (
+        "Here is the full meeting transcript. "
+        "Extract the real ideas following your instructions exactly.\n\n"
+        f"TRANSCRIPT:\n{transcript_payload}"
+        # No [:N] slice — full transcript is sent
     )
 
     try:
@@ -501,14 +700,14 @@ def extract_ideas_with_llama(
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
             "model": model,
-            "temperature": 0.2,
+            "temperature": 0.1,          # lower temp → fewer hallucinations / filler ideas
             "response_format": {"type": "json_object"},
             "messages": [
-                {"role": "system", "content": "You output strict JSON only."},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
             ],
         },
-        timeout=45,
+        timeout=90,   # longer timeout for large transcripts
     )
     resp.raise_for_status()
     data = resp.json()
@@ -521,49 +720,50 @@ def extract_ideas_with_llama(
     if not content:
         raise RuntimeError("LLM returned empty content")
 
+    # Strip accidental markdown code fences just in case
+    content = re.sub(r"^```(?:json)?\s*", "", content)
+    content = re.sub(r"\s*```$", "", content)
+
     parsed = json.loads(content)
     main_ideas = parsed.get("main_ideas", [])
     if not isinstance(main_ideas, list):
         raise RuntimeError("Invalid JSON schema: main_ideas must be a list")
 
+    # Post-processing: validate + sanitise every item
     noise_patterns = [
-        r"^\s*(thanks?|thank you|okay|ok|yeah|yep|nope|right|got it|cool|sure)\s*[.!]*\s*$",
-        r"^\s*(hello|hi|good morning|good afternoon|good evening)\b",
+        re.compile(r"^\s*(thanks?|thank you|okay|ok|yeah|yep|nope|right|got it|cool|sure)\s*[.!]*\s*$", re.I),
+        re.compile(r"^\s*(hello|hi|good morning|good afternoon|good evening)\b", re.I),
+        re.compile(r"^\s*(bye|goodbye|see you|talk later)\b", re.I),
     ]
 
-    cleaned = []
+    cleaned: list[dict[str, Any]] = []
     for i, idea in enumerate(main_ideas[:12], start=1):
         if not isinstance(idea, dict):
             continue
         title = str(idea.get("title", f"Idea {i}")).strip()[:160]
         summary = str(idea.get("summary", "")).strip()[:500]
-        sub_ideas_raw = idea.get("sub_ideas", [])
-        sub_ideas = []
-        if isinstance(sub_ideas_raw, list):
-            for sub in sub_ideas_raw[:12]:
-                if not isinstance(sub, dict):
-                    continue
-                sub_text = str(sub.get("text", "")).strip()
-                if not sub_text:
-                    continue
-                evidence = sub.get("evidence", [])
-                if not isinstance(evidence, list):
-                    evidence = []
-                speakers = sub.get("speakers", [])
-                if not isinstance(speakers, list):
-                    speakers = []
-                is_noise = any(re.match(pat, sub_text.lower()) for pat in noise_patterns)
-                if is_noise or len(sub_text) < 12:
-                    continue
 
-                sub_ideas.append(
-                    {
-                        "text": sub_text[:300],
-                        "speakers": [str(s).strip()[:40] for s in speakers if str(s).strip()],
-                        "evidence": [str(e).strip()[:180] for e in evidence if str(e).strip()][:3],
-                    }
-                )
+        sub_ideas: list[dict[str, Any]] = []
+        for sub in (idea.get("sub_ideas", []) or [])[:12]:
+            if not isinstance(sub, dict):
+                continue
+            sub_text = str(sub.get("text", "")).strip()
+            if not sub_text or len(sub_text) < 15:
+                continue
+            if any(p.match(sub_text) for p in noise_patterns):
+                continue
 
+            evidence = sub.get("evidence", [])
+            speakers = sub.get("speakers", [])
+            sub_ideas.append(
+                {
+                    "text": sub_text[:300],
+                    "speakers": [str(s).strip()[:40] for s in (speakers if isinstance(speakers, list) else []) if str(s).strip()],
+                    "evidence": [str(e).strip()[:180] for e in (evidence if isinstance(evidence, list) else []) if str(e).strip()][:3],
+                }
+            )
+
+        # Skip ideas that have no substance at all
         if not sub_ideas and len(summary) < 20:
             continue
 
@@ -581,8 +781,8 @@ def extract_ideas_with_llama(
 
 def attach_speakers_to_ideas(idea_map: dict[str, Any], utterances: list[dict[str, Any]]) -> dict[str, Any]:
     """
-    Simple speaker attribution:
-    - if the first 30 chars of a sub-idea appears in an utterance, attribute that speaker.
+    Attribute speakers to sub-ideas by substring match of the first 30 chars
+    of the sub-idea text against utterance texts.
     """
     if not idea_map.get("main_ideas") or not utterances:
         return idea_map
@@ -675,6 +875,7 @@ def compute_scores(
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
+
 @app.get("/versions")
 def versions() -> dict[str, Any]:
     out: dict[str, Any] = {"python": os.sys.version}
@@ -682,18 +883,14 @@ def versions() -> dict[str, Any]:
     def add(pkg: str):
         try:
             mod = __import__(pkg)
-            out[pkg] = getattr(mod, "_version", "no __version_")
+            out[pkg] = getattr(mod, "__version__", "no __version__")
         except Exception as e:
             out[pkg] = f"IMPORT_ERROR: {type(e).__name__}: {e}"
 
-    add("torch")
-    add("huggingface_hub")
-    add("pyannote")
-    add("pyannote.audio")
-    add("faster_whisper")
-    add("sklearn")
-    add("numpy")
+    for pkg in ("torch", "huggingface_hub", "pyannote", "pyannote.audio", "faster_whisper", "sklearn", "numpy"):
+        add(pkg)
     return out
+
 
 @app.post("/analyze")
 async def analyze_audio(
@@ -746,10 +943,11 @@ async def collective_analysis(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-    transcript = {"full_text": "", "segments": []}
+    transcript: dict[str, Any] = {"full_text": "", "segments": []}
     speaker_utterances: list[dict[str, Any]] = []
-    idea_map = {"main_ideas": []}
+    idea_map: dict[str, Any] = {"main_ideas": []}
     analysis_error: str | None = None
+    speaker_name_map: dict[str, str] = {}
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -763,17 +961,45 @@ async def collective_analysis(
                 speaker_utterances = align_speakers_to_transcript(
                     diarized["segments_obj"], transcript["segments"]
                 )
+
+                # ── Infer real speaker names before passing to LLM ──────────
+                # This runs on the raw SPEAKER_XX labels so the LLM already
+                # receives human-readable names in the transcript payload.
+                speaker_name_map = infer_speaker_names(speaker_utterances)
+                apply_speaker_names(
+                    speaker_name_map,
+                    utterances=speaker_utterances,
+                )
+
                 try:
+                    # Full transcript, no truncation
                     idea_map = extract_ideas_with_llama(
                         transcript["full_text"],
                         speaker_utterances=speaker_utterances,
                     )
-                except Exception:
+                except Exception as llm_exc:
+                    analysis_error = f"LLM idea extraction failed (using offline fallback): {llm_exc}"
                     sentences = split_into_idea_sentences(transcript["full_text"])
                     idea_map = cluster_ideas(sentences)
+
                 idea_map = attach_speakers_to_ideas(idea_map, speaker_utterances)
+
             except Exception as exc:
                 analysis_error = f"Transcription or idea clustering failed: {exc}"
+
+        # Apply speaker names to diarization outputs too
+        apply_speaker_names(
+            speaker_name_map,
+            segments=diarized["segments"],
+            overlaps=diarized["overlaps"],
+            interruptions=diarized["interruptions"],
+            idea_map=idea_map,
+        )
+
+        # Remap the top-level speakers list
+        renamed_speakers = sorted({
+            speaker_name_map.get(s, s) for s in diarized["speakers"]
+        })
 
         scores = compute_scores(
             overlaps=diarized["overlaps"],
@@ -786,7 +1012,8 @@ async def collective_analysis(
 
         return {
             "num_speakers": diarized["num_speakers"],
-            "speakers": diarized["speakers"],
+            "speakers": renamed_speakers,
+            "speaker_name_map": speaker_name_map,   # expose mapping for debugging
             "segments": diarized["segments"],
             "overlaps": diarized["overlaps"],
             "interruptions": diarized["interruptions"],
