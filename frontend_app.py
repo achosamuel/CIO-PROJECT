@@ -325,29 +325,55 @@ PLOTLY_LAYOUT = dict(
 st.markdown("""
 <div class="hero-title">
     <h1>🧠 Collective Intelligence Analyzer</h1>
-    <p>Upload a meeting recording to uncover speaker dynamics, extract key ideas, and measure collective intelligence.</p>
+    <p>Upload or record audio directly in the app, listen back instantly, and uncover speaker dynamics with AI.</p>
 </div>
 """, unsafe_allow_html=True)
 
 st.markdown("")
 
-# --- Upload Section ---
+# --- Audio Input Section (Upload + In-app Recording + Preview) ---
 col_upload_l, col_upload_c, col_upload_r = st.columns([1, 3, 1])
 with col_upload_c:
-    uploaded_file = st.file_uploader(
-        "Drop your audio file here",
-        type=["wav", "mp3", "m4a", "flac", "ogg"],
-        help="Supported: WAV, MP3, M4A, FLAC, OGG"
-    )
-    if uploaded_file is not None:
-        st.markdown("")
-        if st.button("🚀 Run Deep Analysis", type="primary", use_container_width=True):
-            with st.spinner("🔬 Analyzing audio — diarization, transcription & LLM processing..."):
-                file_bytes = uploaded_file.read()
-                results = call_analyze(file_bytes, uploaded_file.name, min_overlap, cut_in_window)
-                if results:
-                    st.session_state['analysis_results'] = results
-                    st.success("✅ Analysis complete!")
+    source_tabs = st.tabs(["📁 Upload Audio", "🎙️ Record in App"])
+
+    with source_tabs[0]:
+        uploaded_file = st.file_uploader(
+            "Drop your audio file here",
+            type=["wav", "mp3", "m4a", "flac", "ogg"],
+            help="Supported: WAV, MP3, M4A, FLAC, OGG"
+        )
+        if uploaded_file is not None:
+            uploaded_bytes = uploaded_file.getvalue()
+            st.audio(uploaded_bytes, format=uploaded_file.type or "audio/wav")
+
+            st.markdown("")
+            if st.button("🚀 Analyze Uploaded Audio", type="primary", use_container_width=True):
+                with st.spinner("🔬 Analyzing audio — diarization, transcription & LLM processing..."):
+                    results = call_analyze(uploaded_bytes, uploaded_file.name, min_overlap, cut_in_window)
+                    if results:
+                        st.session_state['analysis_results'] = results
+                        st.success("✅ Analysis complete!")
+
+    with source_tabs[1]:
+        if hasattr(st, "audio_input"):
+            recorded_clip = st.audio_input("Record a meeting snippet")
+            if recorded_clip is not None:
+                recorded_bytes = recorded_clip.getvalue()
+                st.audio(recorded_bytes, format=recorded_clip.type or "audio/wav")
+
+                st.markdown("")
+                if st.button("🚀 Analyze Recorded Audio", type="primary", use_container_width=True):
+                    with st.spinner("🔬 Analyzing audio — diarization, transcription & LLM processing..."):
+                        filename = recorded_clip.name or "recorded_audio.wav"
+                        results = call_analyze(recorded_bytes, filename, min_overlap, cut_in_window)
+                        if results:
+                            st.session_state['analysis_results'] = results
+                            st.success("✅ Analysis complete!")
+        else:
+            st.warning(
+                "Your Streamlit version does not support in-app recording (`st.audio_input`). "
+                "Please upgrade Streamlit to use this feature."
+            )
 
 st.markdown("")
 
