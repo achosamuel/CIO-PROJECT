@@ -51,8 +51,8 @@ section[data-testid="stSidebar"] label {
 
 /* Metric cards */
 div[data-testid="stMetric"] {
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(15, 23, 42, 0.70);
+    border: 1px solid rgba(148,163,184,0.25);
     border-radius: 16px;
     padding: 20px 24px;
     backdrop-filter: blur(12px);
@@ -63,16 +63,19 @@ div[data-testid="stMetric"]:hover {
     box-shadow: 0 8px 32px rgba(99, 102, 241, 0.15);
 }
 div[data-testid="stMetric"] label {
-    color: #9ca3af !important;
+    color: #475569 !important;
     font-size: 0.85rem !important;
     font-weight: 500 !important;
     text-transform: uppercase;
     letter-spacing: 0.05em;
 }
 div[data-testid="stMetric"] [data-testid="stMetricValue"] {
-    color: #ffffff !important;
+    color: #0f172a !important;
     font-size: 2rem !important;
     font-weight: 700 !important;
+}
+div[data-testid="stMetric"] [data-testid="stMetricDelta"] {
+    color: #334155 !important;
 }
 
 /* Tabs */
@@ -373,7 +376,7 @@ if 'analysis_results' in st.session_state:
             fig_gauge = go.Figure(go.Indicator(
                 mode="gauge+number",
                 value=overall,
-                number=dict(suffix="/100", font=dict(size=48, color="#e0e7ff")),
+                number=dict(suffix="/100", font=dict(size=48, color="#312e81")),
                 gauge=dict(
                     axis=dict(range=[0, 100], tickcolor="#4b5563", tickfont=dict(color="#6b7280")),
                     bar=dict(color="#818cf8"),
@@ -478,7 +481,12 @@ if 'analysis_results' in st.session_state:
     with tab_speakers:
         st.markdown("")
         debug_info = res.get("scores", {}).get("debug", {})
-        speaking_times = debug_info.get("speaking_time_seconds", {})
+        speaker_name_map = res.get("speaker_name_map", {})
+        raw_speaking_times = debug_info.get("speaking_time_seconds", {})
+        speaking_times = {}
+        for speaker_label, seconds in raw_speaking_times.items():
+            display_name = speaker_name_map.get(speaker_label, speaker_label)
+            speaking_times[display_name] = speaking_times.get(display_name, 0) + seconds
 
         if speaking_times:
             df_speakers = pd.DataFrame([
