@@ -274,6 +274,8 @@ div[data-testid="stAlert"] {
 
 # --- Constants & Backend Config ---
 DEFAULT_BACKEND_URL = "http://127.0.0.1:8000"
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 10
+DEFAULT_READ_TIMEOUT_SECONDS = 1800
 
 # --- Sidebar ---
 with st.sidebar:
@@ -304,9 +306,26 @@ def call_analyze(file_bytes, filename, min_overlap, cut_in):
         "cut_in_window": cut_in
     }
     try:
-        response = requests.post(f"{backend_url}/collective", files=files, data=data, timeout=300)
+        response = requests.post(
+            f"{backend_url}/collective",
+            files=files,
+            data=data,
+            timeout=(DEFAULT_CONNECT_TIMEOUT_SECONDS, DEFAULT_READ_TIMEOUT_SECONDS),
+        )
         response.raise_for_status()
         return response.json()
+    except requests.exceptions.ReadTimeout:
+        st.error(
+            "⏱️ Backend is still processing and exceeded the frontend wait time. "
+            "Try a shorter audio clip or increase timeout settings."
+        )
+        return None
+    except requests.exceptions.ConnectionError:
+        st.error(
+            "🔌 Could not connect to backend. "
+            "Make sure the FastAPI server is running at the configured Backend URL."
+        )
+        return None
     except Exception as e:
         st.error(f"❌ Error connecting to backend: {e}")
         return None
