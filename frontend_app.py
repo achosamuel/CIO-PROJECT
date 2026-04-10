@@ -1,980 +1,607 @@
-"""
-Streamlit frontend for:
-- Upload OR record microphone audio (sounddevice)
-- Send audio to FastAPI backend (/collective or /analyze)
-- Display scores, idea map, transcript, timeline
-- NEW: polished UI, summary cards, guided workflow, and improved charts
-
-Run:
-  python -m streamlit run frontend_app.py
-"""
-
-from __future__ import annotations
-
-import io
-import json
-import tempfile
-import time
-from pathlib import Path
-from typing import Any, Dict
-
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import requests
-import sounddevice as sd
 import streamlit as st
-import streamlit.components.v1 as components
-
-from utils_audio import save_numpy_audio_to_wav
-
-
-# -------------------------
-# Streamlit page config
-# -------------------------
+import requests
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import timedelta
+import io
+import os
+#python -m streamlit run lovable_app.py
+# --- Page Configuration ---
 st.set_page_config(
-    page_title="Collective Organization Analyzer",
-    page_icon="🎧",
+    page_title="Collective Intelligence Audio Analyzer",
+    page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-
-# -------------------------
-# Design system
-# -------------------------
-CUSTOM_CSS = """
+# --- Custom CSS for Premium Design ---
+st.markdown("""
 <style>
-:root {
-    --bg: #081120;
-    --panel: rgba(12, 20, 38, 0.78);
-    --panel-strong: rgba(17, 26, 48, 0.95);
-    --panel-soft: rgba(255, 255, 255, 0.04);
-    --text: #edf2ff;
-    --muted: #aab6d3;
-    --accent: #7c3aed;
-    --accent-2: #14b8a6;
-    --accent-3: #f59e0b;
-    --border: rgba(255, 255, 255, 0.08);
-    --shadow: 0 18px 50px rgba(2, 8, 23, 0.35);
-}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
-.stApp {
-    background:
-        radial-gradient(circle at top left, rgba(124, 58, 237, 0.22), transparent 28%),
-        radial-gradient(circle at top right, rgba(20, 184, 166, 0.18), transparent 24%),
-        linear-gradient(180deg, #081120 0%, #0d1630 55%, #111827 100%);
-    color: var(--text);
+/* Global */
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif;
 }
-
+.main {
+    background: linear-gradient(135deg, #0f0c29 0%, #1a1a3e 40%, #24243e 100%);
+    color: #e0e0e0;
+}
 .block-container {
-    padding-top: 1.5rem;
-    padding-bottom: 3rem;
-    max-width: 1250px;
+    padding-top: 2rem;
+    max-width: 1200px;
 }
 
-h1, h2, h3, h4, h5, h6, p, span, label, div {
-    color: var(--text);
+/* Hide default header bar */
+header[data-testid="stHeader"] {
+    background: transparent;
 }
 
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, rgba(10, 18, 35, 0.97), rgba(14, 24, 45, 0.95));
-    border-right: 1px solid var(--border);
+/* Sidebar */
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #1a1a3e 0%, #0f0c29 100%);
+    border-right: 1px solid rgba(255,255,255,0.06);
+}
+section[data-testid="stSidebar"] .stMarkdown p,
+section[data-testid="stSidebar"] .stMarkdown h3,
+section[data-testid="stSidebar"] label {
+    color: #c0c0d0 !important;
 }
 
-[data-testid="stSidebar"] * {
-    color: var(--text) !important;
-}
-
-[data-testid="stMetric"] {
-    background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.025));
-    border: 1px solid var(--border);
-    border-radius: 18px;
-    padding: 0.9rem 1rem;
-    box-shadow: var(--shadow);
-}
-
-.stButton > button,
-[data-testid="baseButton-primary"] {
-    border-radius: 14px;
-    border: none;
-    background: linear-gradient(135deg, var(--accent), #2563eb);
-    color: white !important;
-    font-weight: 700;
-    min-height: 3rem;
-    box-shadow: 0 14px 30px rgba(37, 99, 235, 0.28);
-}
-
-.stDownloadButton > button,
-.stButton > button:hover,
-[data-testid="baseButton-primary"]:hover {
-    filter: brightness(1.05);
-    transform: translateY(-1px);
-}
-
-.stTextInput input,
-.stNumberInput input,
-.stTextArea textarea,
-div[data-testid="stTextArea"] textarea,
-div[data-testid="stTextArea"] textarea:disabled,
-.stSelectbox div[data-baseweb="select"],
-.stMultiSelect div[data-baseweb="select"],
-.stFileUploader,
-.stSlider,
-.stRadio,
-.stExpander,
-.stTabs [data-baseweb="tab-list"],
-.stDataFrame,
-[data-testid="stAlert"] {
-    border-radius: 16px !important;
-}
-
-.stTextInput input,
-.stNumberInput input,
-.stTextArea textarea,
-div[data-testid="stTextArea"] textarea,
-div[data-testid="stTextArea"] textarea:disabled {
-    background: rgba(12, 20, 38, 0.92) !important;
-    border: 1px solid var(--border) !important;
-    color: var(--text) !important;
-    -webkit-text-fill-color: var(--text) !important;
-    caret-color: var(--text) !important;
-}
-
-div[data-testid="stTextArea"] textarea::placeholder {
-    color: var(--muted) !important;
-}
-
-[data-baseweb="tab-list"] {
-    gap: 0.5rem;
-    background: rgba(255,255,255,0.035);
-    padding: 0.4rem;
-    border-radius: 18px;
-    border: 1px solid var(--border);
-}
-
-button[data-baseweb="tab"] {
-    border-radius: 12px;
-    padding: 0.6rem 1rem;
-    color: var(--muted);
-}
-
-button[data-baseweb="tab"][aria-selected="true"] {
-    background: linear-gradient(135deg, rgba(124,58,237,0.23), rgba(37,99,235,0.18));
-    color: white;
-}
-
-.glass-card {
-    background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
-    border: 1px solid var(--border);
-    border-radius: 24px;
-    padding: 1.35rem;
-    box-shadow: var(--shadow);
-    backdrop-filter: blur(14px);
-}
-
-.hero-card {
-    position: relative;
-    overflow: hidden;
-    padding: 1.7rem;
-    border-radius: 28px;
-    background:
-        linear-gradient(135deg, rgba(124,58,237,0.22), rgba(37,99,235,0.18)),
-        linear-gradient(180deg, rgba(15,23,42,0.88), rgba(15,23,42,0.72));
-    border: 1px solid rgba(255,255,255,0.08);
-    box-shadow: var(--shadow);
-}
-
-.hero-card::after {
-    content: "";
-    position: absolute;
-    inset: auto -40px -60px auto;
-    width: 180px;
-    height: 180px;
-    border-radius: 999px;
-    background: radial-gradient(circle, rgba(20,184,166,0.3), transparent 70%);
-}
-
-.hero-title {
-    font-size: clamp(2rem, 4vw, 3.4rem);
-    line-height: 1.05;
-    font-weight: 800;
-    letter-spacing: -0.03em;
-    margin-bottom: 0.75rem;
-}
-
-.hero-subtitle {
-    color: var(--muted);
-    font-size: 1.02rem;
-    max-width: 56rem;
-    margin-bottom: 1rem;
-}
-
-.badge-row {
-    display: flex;
-    gap: 0.75rem;
-    flex-wrap: wrap;
-    margin-top: 1rem;
-}
-
-.badge-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.45rem;
-    padding: 0.5rem 0.8rem;
-    border-radius: 999px;
-    background: rgba(255,255,255,0.08);
-    border: 1px solid rgba(255,255,255,0.08);
-    color: #e8ecff;
-    font-size: 0.92rem;
-}
-
-.section-heading {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    margin: 1.25rem 0 0.9rem;
-}
-
-.section-heading h2 {
-    margin: 0;
-    font-size: 1.2rem;
-}
-
-.section-copy {
-    color: var(--muted);
-    margin-top: 0.35rem;
-    margin-bottom: 0;
-}
-
-.feature-list {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0.9rem;
-    margin-top: 1rem;
-}
-
-.feature-item {
+/* Metric cards */
+div[data-testid="stMetric"] {
     background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.06);
-    border-radius: 18px;
-    padding: 0.95rem;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 16px;
+    padding: 20px 24px;
+    backdrop-filter: blur(12px);
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+div[data-testid="stMetric"]:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 32px rgba(99, 102, 241, 0.15);
+}
+div[data-testid="stMetric"] label {
+    color: #9ca3af !important;
+    font-size: 0.85rem !important;
+    font-weight: 500 !important;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+    color: #ffffff !important;
+    font-size: 2rem !important;
+    font-weight: 700 !important;
 }
 
-.feature-item strong {
-    display: block;
-    margin-bottom: 0.35rem;
+/* Tabs */
+button[data-baseweb="tab"] {
+    background: transparent !important;
+    color: #9ca3af !important;
+    border: none !important;
+    border-bottom: 2px solid transparent !important;
+    font-weight: 500;
+    padding: 12px 20px !important;
+    transition: all 0.2s;
+}
+button[data-baseweb="tab"]:hover {
+    color: #c7d2fe !important;
+}
+button[data-baseweb="tab"][aria-selected="true"] {
+    color: #818cf8 !important;
+    border-bottom: 2px solid #818cf8 !important;
 }
 
-.helper-note {
-    color: var(--muted);
-    font-size: 0.93rem;
-}
-
-.empty-state {
-    text-align: center;
-    padding: 1.6rem 1rem;
-    border-radius: 18px;
+/* Glass card helper */
+.glass-card {
     background: rgba(255,255,255,0.03);
-    border: 1px dashed rgba(255,255,255,0.12);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 16px;
+    padding: 24px;
+    backdrop-filter: blur(12px);
+    margin-bottom: 16px;
 }
 
-@media (max-width: 900px) {
-    .feature-list {
-        grid-template-columns: 1fr;
-    }
+/* Idea cards */
+.idea-card {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-left: 4px solid #818cf8;
+    border-radius: 12px;
+    padding: 24px 28px;
+    margin-bottom: 16px;
+    backdrop-filter: blur(12px);
+    transition: transform 0.2s, box-shadow 0.2s;
 }
+.idea-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(99, 102, 241, 0.12);
+}
+.idea-card h3 {
+    color: #e0e7ff;
+    margin: 0 0 8px 0;
+    font-size: 1.1rem;
+    font-weight: 600;
+}
+.idea-card p {
+    color: #9ca3af;
+    margin: 0;
+    font-size: 0.95rem;
+    line-height: 1.6;
+}
+
+/* Speaker tag */
+.speaker-tag {
+    display: inline-block;
+    background: linear-gradient(135deg, rgba(99,102,241,0.2), rgba(139,92,246,0.2));
+    color: #c7d2fe;
+    padding: 3px 12px;
+    border-radius: 20px;
+    font-size: 0.8em;
+    margin-right: 6px;
+    border: 1px solid rgba(139,92,246,0.25);
+    font-weight: 500;
+}
+
+/* Transcript */
+.transcript-line {
+    padding: 10px 16px;
+    border-radius: 8px;
+    margin-bottom: 6px;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.04);
+    transition: background 0.15s;
+}
+.transcript-line:hover {
+    background: rgba(255,255,255,0.05);
+}
+.transcript-speaker {
+    font-weight: 600;
+    color: #818cf8;
+}
+.transcript-time {
+    color: #6b7280;
+    font-size: 0.8em;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+/* File uploader */
+div[data-testid="stFileUploader"] {
+    background: rgba(255,255,255,0.03);
+    border: 2px dashed rgba(129, 140, 248, 0.3);
+    border-radius: 16px;
+    padding: 20px;
+    transition: border-color 0.2s;
+}
+div[data-testid="stFileUploader"]:hover {
+    border-color: rgba(129, 140, 248, 0.6);
+}
+
+/* Primary button */
+.stButton > button[kind="primary"],
+.stButton > button {
+    background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 12px !important;
+    padding: 12px 32px !important;
+    font-weight: 600 !important;
+    font-size: 1rem !important;
+    letter-spacing: 0.02em;
+    transition: all 0.2s !important;
+    box-shadow: 0 4px 16px rgba(99, 102, 241, 0.3) !important;
+}
+.stButton > button:hover {
+    transform: translateY(-1px) !important;
+    box-shadow: 0 6px 24px rgba(99, 102, 241, 0.45) !important;
+}
+
+/* Expander */
+details[data-testid="stExpander"] {
+    background: rgba(255,255,255,0.02) !important;
+    border: 1px solid rgba(255,255,255,0.06) !important;
+    border-radius: 12px !important;
+}
+details[data-testid="stExpander"] summary {
+    color: #c7d2fe !important;
+    font-weight: 500;
+}
+
+/* Plotly chart background */
+.js-plotly-plot .plotly .main-svg {
+    background: transparent !important;
+}
+
+/* Dataframe */
+div[data-testid="stDataFrame"] {
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+/* Divider */
+hr {
+    border-color: rgba(255,255,255,0.06) !important;
+}
+
+/* Success / Info / Warning boxes */
+div[data-testid="stAlert"] {
+    border-radius: 12px;
+    border: none;
+}
+
+/* Hero title */
+.hero-title {
+    text-align: center;
+    padding: 20px 0 10px 0;
+}
+.hero-title h1 {
+    font-size: 2.2rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, #818cf8, #c084fc, #f472b6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 8px;
+}
+.hero-title p {
+    color: #9ca3af;
+    font-size: 1.05rem;
+    max-width: 600px;
+    margin: 0 auto;
+    line-height: 1.6;
+}
+
+/* Score gauge label */
+.score-label {
+    text-align: center;
+    color: #9ca3af;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-top: 8px;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(129, 140, 248, 0.3); border-radius: 3px; }
 </style>
-"""
-
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 
-# -------------------------
-# Helpers
-# -------------------------
-def safe_post(url: str, files: dict, data: dict, timeout: int = 600) -> Dict[str, Any]:
-    """POST with clean error messages and stable connection handling."""
+# --- Constants & Backend Config ---
+DEFAULT_BACKEND_URL = "http://127.0.0.1:8000"
+
+# --- Sidebar ---
+with st.sidebar:
+    st.markdown("## ⚙️ Configuration")
+    st.markdown("---")
+    backend_url = st.text_input("🔗 Backend URL", value=DEFAULT_BACKEND_URL)
+    st.markdown("")
+    min_overlap = st.slider("🔀 Min Overlap Threshold (s)", 0.0, 1.0, 0.2, 0.05)
+    cut_in_window = st.slider("✂️ Cut-in Window (s)", 0.1, 5.0, 1.0, 0.1)
+    st.markdown("---")
+    st.markdown("### 📖 About")
+    st.info(
+        "Analyzes meeting audio to extract collective intelligence metrics, "
+        "speaker diarization, and an AI-powered idea map."
+    )
+    st.markdown("")
+    st.caption("Built with pyannote · faster-whisper · Llama 3.3")
+
+
+# --- Helper Functions ---
+def format_time(seconds):
+    return str(timedelta(seconds=int(seconds)))
+
+def call_analyze(file_bytes, filename, min_overlap, cut_in):
+    files = {"file": (filename, file_bytes)}
+    data = {
+        "min_overlap_threshold": min_overlap,
+        "cut_in_window": cut_in
+    }
     try:
-        r = requests.post(
-            url,
-            files=files,
-            data=data,
-            timeout=(10, timeout),
-            headers={"Connection": "close"},
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Could not reach backend: {exc}") from exc
-
-    if r.status_code >= 400:
-        try:
-            payload = r.json()
-            detail = payload.get("detail", payload)
-        except Exception:
-            detail = r.text
-        raise RuntimeError(f"Backend error ({r.status_code}): {detail}")
-    return r.json()
+        response = requests.post(f"{backend_url}/collective", files=files, data=data, timeout=300)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        st.error(f"❌ Error connecting to backend: {e}")
+        return None
 
 
-
-def seconds_to_mmss(x: float) -> str:
-    m = int(x // 60)
-    s = int(x % 60)
-    return f"{m:02d}:{s:02d}"
-
-
-
-def show_json_collapsible(label: str, obj: Any):
-    with st.expander(label, expanded=False):
-        st.code(json.dumps(obj, indent=2, ensure_ascii=False), language="json")
+# --- Plotly dark theme ---
+PLOTLY_LAYOUT = dict(
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(color="#c0c0d0", family="Inter"),
+    margin=dict(l=40, r=40, t=50, b=40),
+)
 
 
+# --- Hero Header ---
+st.markdown("""
+<div class="hero-title">
+    <h1>🧠 Collective Intelligence Analyzer</h1>
+    <p>Upload a meeting recording to uncover speaker dynamics, extract key ideas, and measure collective intelligence.</p>
+</div>
+""", unsafe_allow_html=True)
 
-def record_microphone_wav(seconds: int, sample_rate: int = 16000) -> bytes:
-    """Record from default microphone using sounddevice and return WAV bytes."""
-    if seconds <= 0:
-        raise ValueError("seconds must be > 0")
+st.markdown("")
 
-    audio = sd.rec(
-        int(seconds * sample_rate),
-        samplerate=sample_rate,
-        channels=1,
-        dtype="float32",
+# --- Upload Section ---
+col_upload_l, col_upload_c, col_upload_r = st.columns([1, 3, 1])
+with col_upload_c:
+    uploaded_file = st.file_uploader(
+        "Drop your audio file here",
+        type=["wav", "mp3", "m4a", "flac", "ogg"],
+        help="Supported: WAV, MP3, M4A, FLAC, OGG"
     )
-    sd.wait()
+    if uploaded_file is not None:
+        st.markdown("")
+        if st.button("🚀 Run Deep Analysis", type="primary", use_container_width=True):
+            with st.spinner("🔬 Analyzing audio — diarization, transcription & LLM processing..."):
+                file_bytes = uploaded_file.read()
+                results = call_analyze(file_bytes, uploaded_file.name, min_overlap, cut_in_window)
+                if results:
+                    st.session_state['analysis_results'] = results
+                    st.success("✅ Analysis complete!")
 
-    audio = np.squeeze(audio)
-    if audio.size == 0:
-        raise RuntimeError("No audio captured from microphone.")
+st.markdown("")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        wav_path = Path(tmpdir) / "recording.wav"
-        save_numpy_audio_to_wav(audio, wav_path, sample_rate=sample_rate)
-        return wav_path.read_bytes()
+# --- Results Display ---
+if 'analysis_results' in st.session_state:
+    res = st.session_state['analysis_results']
 
+    tab_overview, tab_ideas, tab_speakers, tab_transcript = st.tabs([
+        "📊 Overview",
+        "💡 Idea Map",
+        "👥 Speakers",
+        "📝 Transcript"
+    ])
 
+    # ──────────────────────────────────
+    # 1. Overview & Scores
+    # ──────────────────────────────────
+    with tab_overview:
+        st.markdown("")
+        scores = res.get("scores", {})
 
-def compute_speaking_and_interruptions(
-    segments: list[dict[str, Any]],
-    interruptions: list[dict[str, Any]],
-) -> pd.DataFrame:
-    """Compute speaking and interruption time per speaker in minutes."""
-    speak: dict[str, float] = {}
-    for s in segments or []:
-        spk = str(s.get("speaker", "UNKNOWN"))
-        start = float(s.get("start", 0.0) or 0.0)
-        end = float(s.get("end", 0.0) or 0.0)
-        dur = max(0.0, end - start)
-        speak[spk] = speak.get(spk, 0.0) + dur
-
-    intr: dict[str, float] = {}
-    for it in interruptions or []:
-        spk = str(it.get("interrupter", "UNKNOWN"))
-        dur = float(it.get("overlap_duration", 0.0) or 0.0)
-        if dur > 0:
-            intr[spk] = intr.get(spk, 0.0) + dur
-
-    speakers = sorted(set(list(speak.keys()) + list(intr.keys())))
-    rows = []
-    for spk in speakers:
-        rows.append(
-            {
-                "speaker": spk,
-                "speaking_min": speak.get(spk, 0.0) / 60.0,
-                "interruption_min": intr.get(spk, 0.0) / 60.0,
+        # Main score gauge
+        overall = scores.get('collective_organization', 0)
+        col_g1, col_g2, col_g3 = st.columns([1, 2, 1])
+        with col_g2:
+            fig_gauge = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=overall,
+                number=dict(suffix="/100", font=dict(size=48, color="#e0e7ff")),
+                gauge=dict(
+                    axis=dict(range=[0, 100], tickcolor="#4b5563", tickfont=dict(color="#6b7280")),
+                    bar=dict(color="#818cf8"),
+                    bgcolor="rgba(255,255,255,0.03)",
+                    borderwidth=0,
+                    steps=[
+                        dict(range=[0, 40], color="rgba(239,68,68,0.15)"),
+                        dict(range=[40, 70], color="rgba(251,191,36,0.15)"),
+                        dict(range=[70, 100], color="rgba(52,211,153,0.15)"),
+                    ],
+                    threshold=dict(line=dict(color="#f472b6", width=3), thickness=0.8, value=overall),
+                ),
+            ))
+            layout_gauge = {
+                **PLOTLY_LAYOUT,
+                "height": 280,
+                "margin": dict(l=30, r=30, t=30, b=10),
             }
-        )
-    return pd.DataFrame(rows)
 
+            fig_gauge.update_layout(**layout_gauge)
+            st.plotly_chart(fig_gauge, use_container_width=True)
+            st.markdown('<div class="score-label">Collective Organization Score</div>', unsafe_allow_html=True)
 
+        st.markdown("")
 
-def render_hero() -> None:
-    st.markdown(
-        """
-        <section class="hero-card">
-            <div class="badge-chip" style="width:max-content; margin-bottom: 1rem;">✨ Redesigned experience</div>
-            <div class="hero-title">Beautiful audio analysis dashboard for teams, workshops, and meetings.</div>
-            <p class="hero-subtitle">
-                Upload or record audio, run speaker analysis, and review clear insights for participation,
-                interruptions, idea clustering, and transcripts in one polished workspace.
-            </p>
-            <div class="badge-row">
-                <div class="badge-chip">🎙️ Upload or record audio</div>
-                <div class="badge-chip">🧠 Collective intelligence scoring</div>
-                <div class="badge-chip">📊 Speaker activity visualization</div>
-                <div class="badge-chip">⚡ FastAPI + Streamlit workflow</div>
-            </div>
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
+        # Sub-metrics
+        col1, col2, col3 = st.columns(3)
+        col1.metric("🛡️ Independence", f"{scores.get('independence', 0)}%")
+        col2.metric("⚖️ Participation Balance", f"{scores.get('participation_balance', 0)}%")
+        col3.metric("🌈 Idea Diversity", f"{scores.get('idea_diversity', 0)}%")
 
+        st.markdown("")
 
-
-def render_section_heading(title: str, subtitle: str) -> None:
-    st.markdown(
-        f"""
-        <div class="section-heading">
-            <div>
-                <h2>{title}</h2>
-                <p class="section-copy">{subtitle}</p>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-
-def render_overview_panel(health_ok: bool, backend_url: str, endpoint: str) -> None:
-    health_label = "Online" if health_ok else "Offline"
-    health_dot = "🟢" if health_ok else "🔴"
-    st.markdown(
-        f"""
-        <div class="glass-card">
-            <h3 style="margin-top:0;">Session overview</h3>
-            <p class="helper-note">A cleaner workflow modeled after modern analytics dashboards.</p>
-            <div class="feature-list">
-                <div class="feature-item">
-                    <strong>{health_dot} Backend status</strong>
-                    <span>{health_label}</span>
-                </div>
-                <div class="feature-item">
-                    <strong>🧭 Active mode</strong>
-                    <span>{endpoint}</span>
-                </div>
-                <div class="feature-item">
-                    <strong>🔗 API target</strong>
-                    <span>{backend_url}</span>
-                </div>
-                <div class="feature-item">
-                    <strong>✅ Design goals</strong>
-                    <span>Clarity, hierarchy, spacing, accessibility</span>
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-
-def render_empty_state(icon: str, title: str, message: str) -> None:
-    st.markdown(
-        f"""
-        <div class="empty-state">
-            <div style="font-size: 2rem; margin-bottom: 0.4rem;">{icon}</div>
-            <div style="font-size: 1.05rem; font-weight: 700; margin-bottom: 0.35rem;">{title}</div>
-            <div class="helper-note">{message}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-
-def render_summary_kpis(num_speakers: int, overlaps: list[dict[str, Any]], interruptions: list[dict[str, Any]], elapsed: float | None) -> None:
-    elapsed_value = f"{elapsed:.1f}s" if elapsed is not None else "--"
-    html = f"""
-    <div id="kpi-root">
-      <style>
-        #kpi-root * {{ box-sizing: border-box; }}
-        #kpi-root .kpi-grid {{
-            display:grid;
-            grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
-            gap:14px;
-            margin: 6px 0 18px;
-        }}
-        #kpi-root .kpi-card {{
-            background: linear-gradient(180deg, rgba(255,255,255,0.07), rgba(255,255,255,0.04));
-            border:1px solid rgba(255,255,255,0.08);
-            border-radius:20px;
-            padding:18px;
-            box-shadow: 0 16px 35px rgba(2,8,23,0.22);
-        }}
-        #kpi-root .kpi-label {{ color:#aab6d3; font-size:13px; margin-bottom:6px; }}
-        #kpi-root .kpi-value {{ color:#f8fbff; font-weight:800; font-size:34px; letter-spacing:-0.03em; }}
-        #kpi-root .kpi-foot {{ color:#c8d2ea; font-size:12px; margin-top:6px; }}
-      </style>
-      <div class="kpi-grid">
-        <div class="kpi-card"><div class="kpi-label">Detected speakers</div><div class="kpi-value" data-target="{num_speakers}">0</div><div class="kpi-foot">Unique voices identified</div></div>
-        <div class="kpi-card"><div class="kpi-label">Overlap events</div><div class="kpi-value" data-target="{len(overlaps)}">0</div><div class="kpi-foot">Moments with simultaneous speech</div></div>
-        <div class="kpi-card"><div class="kpi-label">Interruptions</div><div class="kpi-value" data-target="{len(interruptions)}">0</div><div class="kpi-foot">Detected cut-in events</div></div>
-        <div class="kpi-card"><div class="kpi-label">Processing time</div><div class="kpi-value" data-target-text="{elapsed_value}">{elapsed_value}</div><div class="kpi-foot">End-to-end backend request</div></div>
-      </div>
-      <script>
-        const counters = document.querySelectorAll('#kpi-root .kpi-value[data-target]');
-        counters.forEach((node) => {{
-          const target = Number(node.dataset.target || 0);
-          const duration = 700;
-          const start = performance.now();
-          function tick(now) {{
-            const progress = Math.min((now - start) / duration, 1);
-            const eased = 1 - Math.pow(1 - progress, 3);
-            node.textContent = Math.round(target * eased).toLocaleString();
-            if (progress < 1) requestAnimationFrame(tick);
-          }}
-          requestAnimationFrame(tick);
-        }});
-      </script>
-    </div>
-    """
-    components.html(html, height=170)
-
-
-
-def render_audio_hint() -> None:
-    st.markdown(
-        """
-        <div class="glass-card">
-            <h3 style="margin-top:0;">Tips for the best result</h3>
-            <div class="feature-list">
-                <div class="feature-item">
-                    <strong>Use clear audio</strong>
-                    <span>Reduce background noise and keep speakers close to the microphone.</span>
-                </div>
-                <div class="feature-item">
-                    <strong>Choose the right mode</strong>
-                    <span>Use Collective mode for scores and idea mapping, Analyze mode for diarization only.</span>
-                </div>
-                <div class="feature-item">
-                    <strong>Longer clips help</strong>
-                    <span>Brainstorming clips around 30–90 seconds improve topic and idea extraction.</span>
-                </div>
-                <div class="feature-item">
-                    <strong>Tune overlap sensitivity</strong>
-                    <span>Adjust the thresholds in the sidebar to better capture interruptions.</span>
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# -------------------------
-# Header + layout intro
-# -------------------------
-render_hero()
-st.write("")
-
-
-# -------------------------
-# Sidebar controls
-# -------------------------
-st.sidebar.markdown("## Control center")
-st.sidebar.caption("Set the backend, analysis mode, and interruption sensitivity.")
-
-backend_url = (
-    st.sidebar.text_input(
-        "Backend base URL",
-        value="http://127.0.0.1:8000",
-        help="Example: http://127.0.0.1:8000",
-    )
-    .strip()
-    .rstrip("/")
-)
-
-endpoint = st.sidebar.selectbox(
-    "Analysis mode",
-    ["Collective (ideas + scores)", "Analyze (diarization only)"],
-    index=0,
-)
-
-record_seconds = st.sidebar.slider("Record duration (seconds)", 5, 120, 30, 5)
-
-min_overlap = st.sidebar.slider(
-    "Min overlap threshold (seconds)",
-    0.0,
-    2.0,
-    0.2,
-    0.05,
-    help="Overlap must be at least this long to count as an overlap or interrupt event.",
-)
-
-cut_in_window = st.sidebar.slider(
-    "Cut-in window (seconds)",
-    0.1,
-    3.0,
-    1.0,
-    0.1,
-    help="If a new speaker starts within this window at an overlap start, they are considered the interrupter.",
-)
-
-st.sidebar.divider()
-
-health_ok = False
-try:
-    h = requests.get(f"{backend_url}/health", timeout=3)
-    health_ok = h.status_code == 200
-except Exception:
-    health_ok = False
-
-st.sidebar.write("Backend status:", "✅ Online" if health_ok else "❌ Offline")
-st.sidebar.caption("If offline, start the FastAPI backend and verify the host and port.")
-
-left_top, right_top = st.columns([1.35, 0.95], gap="large")
-with left_top:
-    render_section_heading(
-        "1. Provide audio",
-        "Choose a source, preview the file, and prepare the run with a cleaner and more modern interface.",
-    )
-with right_top:
-    render_overview_panel(health_ok, backend_url, endpoint)
-
-
-# -------------------------
-# Input audio
-# -------------------------
-mode = st.radio(
-    "Choose input method",
-    ["Upload audio", "Record from PC microphone"],
-    horizontal=True,
-    label_visibility="collapsed",
-)
-
-audio_bytes: bytes | None = None
-audio_name: str | None = None
-audio_mime: str = "application/octet-stream"
-
-col_input, col_help = st.columns([1.35, 0.9], gap="large")
-
-with col_input:
-    if mode == "Upload audio":
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.markdown("### Upload audio")
-        st.caption("Supported formats: wav, mp3, m4a, flac, ogg.")
-        uploaded_file = st.file_uploader(
-            "Upload an audio file",
-            type=["wav", "mp3", "m4a", "flac", "ogg"],
-            label_visibility="collapsed",
-        )
-
-        if uploaded_file is not None:
-            audio_bytes = uploaded_file.getvalue()
-            audio_name = uploaded_file.name
-            audio_mime = uploaded_file.type or audio_mime
-            st.audio(audio_bytes)
-            file_size_kb = len(audio_bytes) / 1024
-            info_cols = st.columns(2)
-            info_cols[0].markdown(f"**File name**  \\n{audio_name}")
-            info_cols[1].markdown(f"**Size**  \\n{file_size_kb:.1f} KB")
-        else:
-            render_empty_state("📁", "No audio uploaded yet", "Add a file to unlock the analysis workflow.")
-        st.markdown("</div>", unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.markdown("### Record from microphone")
-        st.caption("Record directly from your default microphone using Python sounddevice.")
-
-        if "mic_audio" not in st.session_state:
-            st.session_state.mic_audio = None
-
-        if st.button("🎙️ Record now", type="primary"):
-            try:
-                with st.spinner(f"Recording for {record_seconds}s..."):
-                    wav_bytes = record_microphone_wav(record_seconds, sample_rate=16000)
-                st.session_state.mic_audio = wav_bytes
-                st.success("Recording complete.")
-            except Exception as exc:
-                st.session_state.mic_audio = None
-                st.error(f"Recording failed: {exc}")
-
-        if st.session_state.mic_audio:
-            audio_bytes = st.session_state.mic_audio
-            audio_name = "recording.wav"
-            audio_mime = "audio/wav"
-            st.audio(audio_bytes, format="audio/wav")
-            st.caption(f"Recorded audio size: {len(audio_bytes) / 1024:.1f} KB")
-        else:
-            render_empty_state("🎧", "No recording captured yet", "Click Record now, speak naturally, then run the analysis.")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-with col_help:
-    render_audio_hint()
-
-if not audio_bytes or not audio_name:
-    st.info("Provide an audio file or complete a microphone recording to continue.")
-    st.stop()
-
-
-# -------------------------
-# Analyze button
-# -------------------------
-render_section_heading(
-    "2. Run analysis",
-    "Launch the backend request and keep the output organized in clear result sections.",
-)
-
-if "busy" not in st.session_state:
-    st.session_state.busy = False
-if "result" not in st.session_state:
-    st.session_state.result = None
-if "error" not in st.session_state:
-    st.session_state.error = None
-if "elapsed" not in st.session_state:
-    st.session_state.elapsed = None
-
-run_col, meta_col = st.columns([0.9, 1.1], gap="large")
-with run_col:
-    run = st.button("Run analysis", type="primary", use_container_width=True, disabled=st.session_state.busy)
-with meta_col:
-    st.markdown(
-        f"""
-        <div class="glass-card">
-            <strong>Selected configuration</strong>
-            <div class="helper-note" style="margin-top:0.45rem;">
-                Mode: {endpoint}<br>
-                Min overlap: {min_overlap:.2f}s<br>
-                Cut-in window: {cut_in_window:.1f}s
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-if run:
-    st.session_state.busy = True
-    st.session_state.result = None
-    st.session_state.error = None
-    st.session_state.elapsed = None
-
-api_path = "/collective" if endpoint.startswith("Collective") else "/analyze"
-api_url = f"{backend_url}{api_path}"
-
-if st.session_state.busy:
-    with st.spinner("Analyzing... the first run can be slower while models load."):
-        t0 = time.time()
-        try:
-            result = safe_post(
-                api_url,
-                files={"file": (audio_name, io.BytesIO(audio_bytes), audio_mime)},
-                data={
-                    "min_overlap_threshold": str(min_overlap),
-                    "cut_in_window": str(cut_in_window),
-                },
-                timeout=900,
-            )
-            st.session_state.result = result
-        except Exception as exc:
-            st.session_state.error = str(exc)
-        finally:
-            st.session_state.busy = False
-            st.session_state.elapsed = time.time() - t0
-
-if st.session_state.error:
-    st.error(st.session_state.error)
-    st.stop()
-
-result = st.session_state.result
-if not result:
-    render_empty_state("🚀", "Ready when you are", "Run analysis to generate scores, transcripts, and speaker insights.")
-    st.stop()
-
-st.success(f"Analysis complete in {st.session_state.elapsed:.1f}s")
-
-
-# -------------------------
-# Results summary
-# -------------------------
-render_section_heading(
-    "3. Results",
-    "A cleaner result hierarchy with KPI cards, focused tabs, and readable detail views.",
-)
-
-num_speakers = int(result.get("num_speakers", 0) or 0)
-speakers = result.get("speakers", []) or []
-segments = result.get("segments", []) or []
-overlaps = result.get("overlaps", []) or []
-interruptions = result.get("interruptions", []) or []
-
-render_summary_kpis(num_speakers, overlaps, interruptions, st.session_state.elapsed)
-
-if speakers:
-    speaker_chips = " ".join(f"<span class=\"badge-chip\">👤 {speaker}</span>" for speaker in speakers)
-    st.markdown(f"<div class=\"badge-row\">{speaker_chips}</div>", unsafe_allow_html=True)
-
-
-# -------------------------
-# Tabs
-# -------------------------
-tabs = st.tabs(["Overview", "Scores", "Idea Map", "Transcript", "Timeline", "Charts", "Raw JSON"])
-
-with tabs[0]:
-    left, right = st.columns([1.1, 0.9], gap="large")
-    with left:
-        st.markdown("### Analysis snapshot")
-        snapshot_rows = [
-            {"metric": "Speakers detected", "value": num_speakers},
-            {"metric": "Overlap events", "value": len(overlaps)},
-            {"metric": "Interruptions", "value": len(interruptions)},
-            {"metric": "Segments", "value": len(segments)},
-            {"metric": "Mode", "value": endpoint},
-            {"metric": "Backend URL", "value": backend_url},
+        # Radar
+        categories = ['Independence', 'Participation\nBalance', 'Idea\nDiversity']
+        values = [
+            scores.get('independence', 0),
+            scores.get('participation_balance', 0),
+            scores.get('idea_diversity', 0),
         ]
-        st.dataframe(pd.DataFrame(snapshot_rows), use_container_width=True, hide_index=True)
-    with right:
-        st.markdown("### Recommendation")
-        if num_speakers <= 1:
-            render_empty_state("🗣️", "Add more participants", "This clip appears to contain one speaker or very limited turn-taking.")
-        elif len(interruptions) > len(overlaps) * 0.5 and overlaps:
-            render_empty_state("⚠️", "High interruption density", "Consider increasing facilitation or revisiting overlap thresholds for validation.")
-        else:
-            render_empty_state("✅", "Balanced session", "The session appears readable and ready for deeper score and transcript review.")
 
-with tabs[1]:
-    if "scores" not in result:
-        render_empty_state("📈", "Scores unavailable", "Collective mode is required to calculate organization scores.")
-    else:
-        scores = result["scores"]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Overall", scores.get("collective_organization", 0))
-        c2.metric("Independence", scores.get("independence", 0))
-        c3.metric("Participation Balance", scores.get("participation_balance", 0))
-        c4.metric("Idea Diversity", scores.get("idea_diversity", 0))
+        fig_radar = go.Figure()
+        fig_radar.add_trace(go.Scatterpolar(
+            r=values + [values[0]],
+            theta=categories + [categories[0]],
+            fill='toself',
+            fillcolor='rgba(129, 140, 248, 0.15)',
+            line=dict(color='#818cf8', width=2),
+            marker=dict(size=8, color='#c084fc'),
+        ))
+        fig_radar.update_layout(
+            polar=dict(
+                bgcolor="rgba(0,0,0,0)",
+                radialaxis=dict(visible=True, range=[0, 100], gridcolor="rgba(255,255,255,0.06)",
+                                tickfont=dict(color="#6b7280", size=10)),
+                angularaxis=dict(gridcolor="rgba(255,255,255,0.06)",
+                                 tickfont=dict(color="#c0c0d0", size=12)),
+            ),
+            showlegend=False,
+            height=380,
+            **PLOTLY_LAYOUT,
+        )
+        st.plotly_chart(fig_radar, use_container_width=True)
 
-        debug = scores.get("debug", {}) or {}
-        if debug.get("analysis_error"):
-            st.warning(f"Analysis warning: {debug['analysis_error']}")
-
-        if debug:
-            debug_df = pd.DataFrame([{"metric": k, "value": v} for k, v in debug.items()])
-            st.markdown("### Supporting metrics")
-            st.dataframe(debug_df, use_container_width=True, hide_index=True)
-
-with tabs[2]:
-    if "idea_map" not in result:
-        render_empty_state("🧠", "Idea map unavailable", "Collective mode is required to extract clustered ideas.")
-    else:
-        idea_map = result.get("idea_map", {}) or {}
-        main_ideas = idea_map.get("main_ideas", []) or []
+    # ──────────────────────────────────
+    # 2. Idea Map
+    # ──────────────────────────────────
+    with tab_ideas:
+        st.markdown("")
+        idea_map = res.get("idea_map", {})
+        main_ideas = idea_map.get("main_ideas", [])
 
         if not main_ideas:
-            render_empty_state("💡", "No ideas extracted", "Try a longer brainstorming audio clip, ideally 30 to 90 seconds.")
+            st.warning("No significant ideas were extracted.")
         else:
-            st.caption("Ideas are extracted from the full transcript with Llama and filtered to hide conversational filler.")
-            st.markdown("### Main ideas")
-            for index, idea in enumerate(main_ideas, start=1):
-                title = idea.get("title", f"Idea {index}")
-                summary = idea.get("summary", "")
-                with st.expander(f"🧠 {title}", expanded=index == 1):
-                    if summary:
-                        st.write(summary)
+            for idx, idea in enumerate(main_ideas):
+                st.markdown(f"""
+                <div class="idea-card">
+                    <h3>💡 {idea.get('title', 'Untitled Idea')}</h3>
+                    <p>{idea.get('summary', '')}</p>
+                </div>
+                """, unsafe_allow_html=True)
 
-                    sub_ideas = idea.get("sub_ideas", []) or []
-                    if not sub_ideas:
-                        st.caption("No sub-ideas available.")
-                    else:
-                        rows = []
-                        for s in sub_ideas:
-                            evidences = s.get("evidence", []) or []
-                            rows.append(
-                                {
-                                    "sub_idea": s.get("text", ""),
-                                    "speakers": ", ".join(s.get("speakers", []) or []),
-                                    "evidence": " | ".join(evidences[:2]),
-                                }
-                            )
-                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                for sub in idea.get("sub_ideas", []):
+                    with st.expander(f"🔹 {sub.get('text', '')[:100]}"):
+                        speakers = sub.get("speakers", [])
+                        if speakers:
+                            tags = " ".join([f'<span class="speaker-tag">{s}</span>' for s in speakers])
+                            st.markdown(f"**Contributors:** {tags}", unsafe_allow_html=True)
+                        evidence = sub.get("evidence", [])
+                        if evidence:
+                            st.markdown("**Evidence:**")
+                            for e in evidence:
+                                st.markdown(f"> _{e}_")
 
-with tabs[3]:
-    if "transcript" not in result:
-        render_empty_state("📝", "Transcript unavailable", "Collective mode is required to render transcript details.")
-    else:
-        transcript = result.get("transcript", {}) or {}
-        full_text = transcript.get("full_text", "") or ""
-        segs = transcript.get("segments", []) or []
+                if idx < len(main_ideas) - 1:
+                    st.markdown("")
 
-        if not full_text and not segs:
-            render_empty_state("🔇", "Transcript is empty", "Check the faster-whisper installation and the audio quality.")
-        else:
-            st.markdown("### Full transcript")
-            st.text_area("Transcript preview", value=full_text[:8000], height=260, label_visibility="collapsed")
+    # ──────────────────────────────────
+    # 3. Speaker Analysis
+    # ──────────────────────────────────
+    with tab_speakers:
+        st.markdown("")
+        debug_info = res.get("scores", {}).get("debug", {})
+        speaking_times = debug_info.get("speaking_time_seconds", {})
 
-            st.markdown("### Timestamped segments")
-            if segs:
-                st.dataframe(pd.DataFrame(segs), use_container_width=True, hide_index=True)
-            else:
-                st.caption("No timestamped transcript segments available.")
+        if speaking_times:
+            df_speakers = pd.DataFrame([
+                {"Speaker": s, "Seconds": t, "Minutes": round(t / 60, 2)}
+                for s, t in speaking_times.items()
+            ])
 
-with tabs[4]:
-    if not segments:
-        render_empty_state("⏱️", "No timeline data", "No diarization segments were returned for this analysis.")
-    else:
-        df = pd.DataFrame(segments)
-        df["start_mmss"] = df["start"].apply(seconds_to_mmss)
-        df["end_mmss"] = df["end"].apply(seconds_to_mmss)
+            col_left, col_right = st.columns(2)
 
-        st.markdown("### Speaker segments")
-        st.dataframe(df[["speaker", "start", "end", "start_mmss", "end_mmss"]], use_container_width=True, hide_index=True)
+            with col_left:
+                colors = px.colors.qualitative.Pastel
+                fig_pie = px.pie(
+                    df_speakers, values='Seconds', names='Speaker',
+                    title="Speaking Time Distribution",
+                    color_discrete_sequence=colors,
+                    hole=0.45,
+                )
+                fig_pie.update_traces(
+                    textposition='inside', textinfo='percent+label',
+                    textfont=dict(color="#1a1a3e", size=12),
+                    marker=dict(line=dict(color='rgba(0,0,0,0.2)', width=1)),
+                )
+                fig_pie.update_layout(height=400, **PLOTLY_LAYOUT)
+                st.plotly_chart(fig_pie, use_container_width=True)
 
-        detail_left, detail_right = st.columns(2, gap="large")
-        with detail_left:
-            st.markdown("### Overlaps")
-            if overlaps:
-                st.dataframe(pd.DataFrame(overlaps), use_container_width=True, hide_index=True)
-            else:
-                st.caption("No overlaps detected with the current thresholds.")
-        with detail_right:
-            st.markdown("### Interruptions")
-            if interruptions:
-                st.dataframe(pd.DataFrame(interruptions), use_container_width=True, hide_index=True)
-            else:
-                st.caption("No interruptions detected with the current thresholds.")
+            with col_right:
+                st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+                st.markdown("### ⚡ Interruption Analysis")
+                interruption_count = len(res.get('interruptions', []))
+                ipm = debug_info.get('interruptions_per_min', 0)
 
-with tabs[5]:
-    if not segments:
-        render_empty_state("📊", "No chart data", "Run analysis with valid diarization output to generate charts.")
-    else:
-        df_chart = compute_speaking_and_interruptions(segments, interruptions)
+                c1, c2 = st.columns(2)
+                c1.metric("Total", interruption_count)
+                c2.metric("Per Minute", f"{ipm:.1f}")
 
-        if df_chart.empty:
-            render_empty_state("📉", "Not enough data", "There is not enough speaker timing information to draw charts.")
-        else:
-            st.markdown("### Speaking vs interruption time")
-            df_chart = df_chart.sort_values("speaker").reset_index(drop=True)
-            speakers_list = df_chart["speaker"].tolist()
-            x = np.arange(len(speakers_list))
-            width = 0.38
+                if res.get('interruptions'):
+                    df_int = pd.DataFrame(res.get('interruptions'))
+                    st.dataframe(
+                        df_int[['interrupter', 'interrupted', 'timestamp']],
+                        use_container_width=True, hide_index=True,
+                    )
+                st.markdown('</div>', unsafe_allow_html=True)
 
-            plt.style.use("dark_background")
-            fig, ax = plt.subplots(figsize=(10, 4.5))
-            fig.patch.set_alpha(0)
-            ax.set_facecolor("#111827")
+        # Timeline
+        st.markdown("")
+        st.markdown("### 📅 Speaker Timeline")
+        segments = res.get("segments", [])
+        if segments:
+            df_timeline = pd.DataFrame(segments)
+            # Convert seconds to datetime for px.timeline
+            epoch = pd.Timestamp("2000-01-01")
+            df_timeline["start_dt"] = df_timeline["start"].apply(lambda s: epoch + pd.Timedelta(seconds=s))
+            df_timeline["end_dt"] = df_timeline["end"].apply(lambda s: epoch + pd.Timedelta(seconds=s))
 
-            palette = ["#8b5cf6", "#22c55e", "#38bdf8", "#f59e0b", "#ef4444", "#14b8a6"]
-            colors = [palette[i % len(palette)] for i in range(len(speakers_list))]
-
-            ax.bar(
-                x - width / 2,
-                df_chart["speaking_min"].values,
-                width,
-                label="Speaking (min)",
-                color=colors,
-                alpha=0.92,
+            palette = ["#818cf8", "#c084fc", "#f472b6", "#34d399", "#fbbf24", "#60a5fa", "#f87171"]
+            fig_timeline = px.timeline(
+                df_timeline, x_start="start_dt", x_end="end_dt",
+                y="speaker", color="speaker",
+                color_discrete_sequence=palette,
             )
-            ax.bar(
-                x + width / 2,
-                df_chart["interruption_min"].values,
-                width,
-                label="Interrupting (min)",
-                color=colors,
-                alpha=0.38,
-                hatch="//",
+            fig_timeline.update_layout(
+                height=max(200, len(speaking_times) * 60 + 80),
+                xaxis_title="Time",
+                yaxis_title="",
+                showlegend=False,
+                **PLOTLY_LAYOUT,
             )
+            fig_timeline.update_yaxes(autorange="reversed")
+            st.plotly_chart(fig_timeline, use_container_width=True)
 
-            ax.set_xticks(x)
-            ax.set_xticklabels(speakers_list, rotation=20, ha="right")
-            ax.set_ylabel("Minutes")
-            ax.set_title("Per-speaker speaking time and interruption time")
-            ax.grid(axis="y", alpha=0.2, linestyle="--")
-            for spine in ax.spines.values():
-                spine.set_visible(False)
-            ax.legend(frameon=False)
+    # ──────────────────────────────────
+    # 4. Transcript
+    # ──────────────────────────────────
+    with tab_transcript:
+        st.markdown("")
+        search_query = st.text_input("🔍 Search transcript...", "", placeholder="Type to filter...")
+        st.markdown("")
 
-            st.pyplot(fig, clear_figure=True)
-            st.dataframe(df_chart, use_container_width=True, hide_index=True)
+        utterances = res.get("speaker_utterances", [])
+        found = 0
+        for u in utterances:
+            speaker = u.get("speaker", "UNKNOWN")
+            text = u.get("text", "")
+            timestamp = format_time(u.get("start", 0))
 
-with tabs[6]:
-    show_json_collapsible("Full response JSON", result)
+            if search_query and search_query.lower() not in text.lower() and search_query.lower() not in speaker.lower():
+                continue
+
+            found += 1
+            st.markdown(f"""
+            <div class="transcript-line">
+                <span class="transcript-time">[{timestamp}]</span>
+                <span class="transcript-speaker">{speaker}:</span>
+                <span style="color: #d1d5db;">{text}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        if search_query and found == 0:
+            st.info("No matching utterances found.")
+
+else:
+    # Empty state
+    st.markdown("")
+    col_e1, col_e2, col_e3 = st.columns([1, 2, 1])
+    with col_e2:
+        st.markdown("""
+        <div class="glass-card" style="text-align: center; padding: 60px 40px;">
+            <div style="font-size: 4rem; margin-bottom: 16px;">🎙️</div>
+            <h3 style="color: #e0e7ff; font-weight: 600; margin-bottom: 8px;">No analysis yet</h3>
+            <p style="color: #9ca3af;">Upload an audio file above and click <strong>Run Deep Analysis</strong> to get started.</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# --- Footer ---
+st.markdown("")
+st.divider()
+st.markdown("""
+<div style="text-align: center; padding: 10px 0;">
+    <span style="color: #6b7280; font-size: 0.85rem;">
+        Powered by <strong style="color:#818cf8;">pyannote</strong> · 
+        <strong style="color:#c084fc;">faster-whisper</strong> · 
+        <strong style="color:#f472b6;">Llama 3.3 via Groq</strong>
+    </span>
+</div>
+""", unsafe_allow_html=True)
